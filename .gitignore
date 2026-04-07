@@ -1,4 +1,4 @@
 /checkpoints
 
 # Python bytecode cache directories
-__pycache__/
+**/__pycache__/
