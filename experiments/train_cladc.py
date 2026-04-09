@@ -44,10 +44,12 @@ def main(args):
     config = load_config(args.config)
     expansion_cfg = config.get('network_expansion', {})
     expansion_strategy = str(expansion_cfg.get('strategy', 'all_layers')).strip().lower()
+    pruning_cfg = config.get('network_pruning', {})
     
     print(f"Configuration loaded from {args.config}")
     print(f"Backbone: resnet50d")
     print(f"Network Expansion Strategy: {expansion_strategy}")
+    print(f"Network Pruning Enabled: {pruning_cfg.get('enabled', False)}")
     print(f"Device: {args.device}")
     
     # Set seed
@@ -66,7 +68,11 @@ def main(args):
     model = create_expandable_resnet(
         num_initial_classes=num_classes
     )
-    print(f"Model created with {model.get_num_parameters():,} parameters")
+    effective_params = model.get_effective_num_parameters() if hasattr(model, 'get_effective_num_parameters') else model.get_num_parameters()
+    print(
+        f"Model created with {model.get_num_parameters():,} total parameters "
+        f"({effective_params:,} effective for budget)"
+    )
     
     # Create replay buffer
     print("\nCreating replay buffer")
@@ -177,6 +183,12 @@ def main(args):
         else:
             f.write("  Layer Allocation: budget-aware even distribution across all 4 layers\n")
         f.write("\n")
+
+        f.write("Network Pruning:\n")
+        f.write(f"  Enabled: {pruning_cfg.get('enabled', False)}\n")
+        f.write(f"  Amount (per task): {pruning_cfg.get('amount', 0.0)}\n")
+        f.write(f"  Scope: {pruning_cfg.get('scope', 'whole_model')}\n")
+        f.write("\n")
         
         f.write("="*80 + "\n\n")
         
@@ -270,6 +282,19 @@ def main(args):
                 f.write(f"  Task {task_id}: {', '.join(expansions)}\n")
             else:
                 f.write(f"  Task {task_id}: none\n")
+
+        f.write("\nNetwork Pruning Per Task:\n")
+        pruning_by_task = {entry['task_id']: entry for entry in trainer.pruning_history}
+        for task_id in range(num_tasks):
+            entry = pruning_by_task.get(task_id)
+            if not entry:
+                f.write(f"  Task {task_id}: none\n")
+                continue
+            f.write(
+                f"  Task {task_id}: pruned={entry['pruned_params']:,}, "
+                f"effective={entry['effective_params_before']:,}->{entry['effective_params_after']:,}, "
+                f"amount={entry['amount']:.4f}, scope={entry['scope']}\n"
+            )
         
         f.write("\n" + "="*80 + "\n")
         f.write("FINAL MODEL PERFORMANCE (End of Training)\n")

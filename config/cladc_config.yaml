@@ -47,5 +47,10 @@ network_expansion:
   # all_layers: budget-aware, evenly distributed across layer1-4 each task start
   # strategy: "layer2_layer3_split"  # Expands both layer2 and layer3 each task (50/50)
 
+network_pruning:
+  enabled: true
+  amount: 0.02  # Fraction pruned at task end (applied by scope)
+  scope: "whole_model"  # Options: "whole_model", "older_adapters_only", or "all_adapters"
+
 logging:
   save_dir: "./checkpoints/cladc"

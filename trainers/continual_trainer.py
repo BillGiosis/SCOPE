@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.nn.utils.prune as torch_prune
 from torch.utils.data import DataLoader, ConcatDataset, Subset
 from typing import Dict, List, Optional
 import time
@@ -92,7 +93,12 @@ class ContinualLearner:
         self.expansion_strategy = str(expansion_cfg.get('strategy', 'all_layers')).strip().lower()
         self.expansion_layer_order = self._resolve_expansion_layers(self.expansion_strategy)
 
-        base_params = int(self.model.get_num_parameters())
+        pruning_cfg = config.get('network_pruning', {})
+        self.pruning_enabled = pruning_cfg.get('enabled', False)
+        self.pruning_amount = float(pruning_cfg.get('amount', 0.0))
+        self.pruning_scope = str(pruning_cfg.get('scope', 'whole_model')).strip().lower()
+
+        base_params = int(self._get_effective_model_params())
         max_ratio = float(config.get('benchmark', {}).get('max_params_ratio', 1.05))
         self.max_params = int(base_params * max_ratio)
         
@@ -101,6 +107,8 @@ class ContinualLearner:
         
         self.task_expansions = {}
         self.expansion_history = []
+        self.pruning_history = []
+        self.current_task_new_adapter_ids = set()
 
     def _resolve_expansion_layers(self, strategy: str) -> List[str]:
         """Resolve configured strategy into an expansion layer schedule."""
@@ -130,9 +138,21 @@ class ContinualLearner:
         # layer2_layer3_split: expand both layers every task (50/50 within task).
         return list(self.expansion_layer_order)
 
+    def _get_effective_model_params(self) -> int:
+        """
+        Count active model parameters for budget checks.
+
+        When pruning masks are present, masked-out parameters are excluded.
+        """
+        if hasattr(self.model, 'get_effective_num_parameters'):
+            return int(self.model.get_effective_num_parameters())
+        if hasattr(self.model, 'get_num_parameters'):
+            return int(self.model.get_num_parameters())
+        return int(sum(p.numel() for p in self.model.parameters()))
+
     def _get_available_param_budget(self) -> int:
         """Return remaining parameter budget before reaching max_params."""
-        current_params = int(self.model.get_num_parameters())
+        current_params = self._get_effective_model_params()
         return max(0, int(self.max_params - current_params))
 
     def _get_all_layers_budget_aware_targets(self) -> List[str]:
@@ -209,6 +229,8 @@ class ContinualLearner:
     def _expand_network_at_task_start(self, task_id: int):
         """Apply deterministic network expansion once at the start of each task."""
         executed = []
+        before_adapter_ids = {id(adapter) for _, _, adapter in self._iter_adapters()}
+        self.current_task_new_adapter_ids = set()
 
         if not self.expansion_enabled:
             print("Task-start network expansion disabled by config")
@@ -232,10 +254,26 @@ class ContinualLearner:
         for layer_name in executed:
             self.expansion_history.append((task_id, f"expand_{layer_name}"))
 
+        after_adapter_ids = {id(adapter) for _, _, adapter in self._iter_adapters()}
+        self.current_task_new_adapter_ids = after_adapter_ids - before_adapter_ids
+
         if executed:
             print(f"Expanded at task start: {executed}")
         else:
             print("No expansion executed at task start")
+
+    def _iter_adapters(self):
+        """Yield (layer_name, block_index, adapter_module) for all adapters in model."""
+        for layer_name in ["layer1", "layer2", "layer3", "layer4"]:
+            if not hasattr(self.model, layer_name):
+                continue
+            layer = getattr(self.model, layer_name)
+            for block_idx, block in enumerate(layer):
+                adapters = getattr(block, 'adapters', None)
+                if adapters is None:
+                    continue
+                for adapter in adapters:
+                    yield layer_name, block_idx, adapter
 
     def _prepare_training_model_for_task(self, task_id: int):
         """Compile a training-only model once per task after expansion."""
@@ -255,7 +293,7 @@ class ContinualLearner:
     def _try_expand_layer(self, layer_name: str) -> bool:
         """Attempt to expand one layer while respecting the parameter budget."""
         try:
-            current_params = self.model.get_num_parameters()
+            current_params = self._get_effective_model_params()
             projected_delta = self._estimate_expand_layer_params_delta(layer_name)
 
             if projected_delta <= 0:
@@ -422,6 +460,7 @@ class ContinualLearner:
 
         # Automatically distill replay memory at each chronological task boundary.
         self._auto_distill_replay_buffer_end_of_task(task_id)
+        self._auto_prune_network_end_of_task(task_id)
         
         # Final Full Evaluation
         print(f"\nFinal evaluation after task {task_id}:")
@@ -653,6 +692,279 @@ class ContinualLearner:
         except Exception as e:
             print(f"[WARNING] Auto replay-buffer distillation failed after task {task_id}: {e}")
 
+    def _collect_prunable_adapter_candidates(self) -> List[Dict]:
+        """Collect removable adapter candidates while excluding adapters added in current task."""
+        candidates = []
+
+        for layer_name in ["layer1", "layer2", "layer3", "layer4"]:
+            if not hasattr(self.model, layer_name):
+                continue
+            layer = getattr(self.model, layer_name)
+            for block_idx, block in enumerate(layer):
+                adapters = getattr(block, 'adapters', None)
+                if adapters is None or len(adapters) == 0:
+                    continue
+
+                for adapter_idx, adapter in enumerate(adapters):
+                    adapter_id = id(adapter)
+                    is_new_adapter = adapter_id in self.current_task_new_adapter_ids
+                    if self.pruning_scope == 'older_adapters_only' and is_new_adapter:
+                        continue
+
+                    adapter_params = int(sum(p.numel() for p in adapter.parameters()))
+                    if adapter_params <= 0:
+                        continue
+
+                    # Lower score means lower importance and thus higher prune priority.
+                    l1_score = 0.0
+                    for p in adapter.parameters():
+                        l1_score += float(p.detach().abs().sum().item())
+
+                    candidates.append({
+                        'layer_name': layer_name,
+                        'block_idx': int(block_idx),
+                        'adapter_idx': int(adapter_idx),
+                        'adapter_params': adapter_params,
+                        'score': l1_score
+                    })
+
+        return candidates
+
+    def _collect_prunable_dense_parameters(self) -> List[tuple]:
+        """
+        Collect Conv/Linear weights across the whole model for magnitude pruning.
+
+        Current-task adapters are excluded so freshly introduced task adapters
+        remain untouched at this task boundary.
+        """
+        protected_module_ids = set()
+        for _, _, adapter in self._iter_adapters():
+            if id(adapter) not in self.current_task_new_adapter_ids:
+                continue
+            for m in adapter.modules():
+                protected_module_ids.add(id(m))
+
+        modules_to_prune = []
+        for module in self.model.modules():
+            if not isinstance(module, (nn.Conv2d, nn.Linear)):
+                continue
+            if not hasattr(module, 'weight'):
+                continue
+            if id(module) in protected_module_ids:
+                continue
+            modules_to_prune.append((module, 'weight'))
+
+        return modules_to_prune
+
+    def _prepare_modules_for_unstructured_pruning(self, modules_to_prune: List[tuple]):
+        """
+        Ensure prunable tensors are contiguous so torch prune internals that use
+        view() do not fail on channels-last/non-standard strides.
+        """
+        for module, param_name in modules_to_prune:
+            for attr_name in (param_name, f"{param_name}_orig"):
+                if not hasattr(module, attr_name):
+                    continue
+
+                attr = getattr(module, attr_name)
+                if isinstance(attr, nn.Parameter):
+                    attr.data = attr.data.contiguous()
+                    continue
+
+                if torch.is_tensor(attr):
+                    setattr(module, attr_name, attr.contiguous())
+
+    def _remove_pruning_reparam_if_present(
+        self,
+        modules_to_prune: List[tuple],
+        keep_existing_reparam: Optional[set] = None
+    ):
+        """Best-effort cleanup of pruning reparameterization wrappers."""
+        if keep_existing_reparam is None:
+            keep_existing_reparam = set()
+
+        for module, param_name in modules_to_prune:
+            key = (id(module), param_name)
+            if key in keep_existing_reparam:
+                continue
+            if not hasattr(module, f"{param_name}_orig"):
+                continue
+            try:
+                torch_prune.remove(module, param_name)
+            except Exception:
+                # Keep cleanup best-effort; original prune exception is reported upstream.
+                pass
+
+    def _auto_prune_network_end_of_task(self, task_id: int):
+        """Apply network pruning after replay-buffer distillation at each task boundary."""
+        if not self.pruning_enabled:
+            return
+
+        prune_amount = min(max(float(self.pruning_amount), 0.0), 1.0)
+        if prune_amount <= 0.0:
+            print(f"Pruning enabled but amount is {prune_amount}; skipping at task {task_id}")
+            return
+
+        if self.pruning_scope == 'whole_model':
+            modules_to_prune = self._collect_prunable_dense_parameters()
+            if not modules_to_prune:
+                print(
+                    f"No eligible whole-model parameters found at task {task_id} "
+                    "(current-task adapters are protected)."
+                )
+                return
+
+            before_effective = self._get_effective_model_params()
+            preexisting_reparam = set()
+            try:
+                self._prepare_modules_for_unstructured_pruning(modules_to_prune)
+                preexisting_reparam = {
+                    (id(module), param_name)
+                    for module, param_name in modules_to_prune
+                    if hasattr(module, f"{param_name}_orig")
+                }
+
+                torch_prune.global_unstructured(
+                    modules_to_prune,
+                    pruning_method=torch_prune.L1Unstructured,
+                    amount=prune_amount
+                )
+
+                # Keep pruning masks so zeroed entries remain inactive across tasks.
+                masked_modules = sum(
+                    1 for module, param_name in modules_to_prune
+                    if hasattr(module, f"{param_name}_orig")
+                )
+
+                after_effective = self._get_effective_model_params()
+                pruned_now = max(0, before_effective - after_effective)
+
+                self.pruning_history.append({
+                    'task_id': int(task_id),
+                    'scope': self.pruning_scope,
+                    'amount': float(prune_amount),
+                    'effective_params_before': int(before_effective),
+                    'effective_params_after': int(after_effective),
+                    'pruned_params': int(pruned_now),
+                    'pruned_modules': int(len(modules_to_prune)),
+                    'masked_modules': int(masked_modules)
+                })
+
+                print(
+                    f"Auto-pruned whole model at end of task {task_id}: "
+                    f"amount={prune_amount:.4f}, modules={len(modules_to_prune)}, "
+                    f"effective params {before_effective:,} -> {after_effective:,} "
+                    f"(freed {pruned_now:,})"
+                )
+            except Exception as e:
+                self._remove_pruning_reparam_if_present(
+                    modules_to_prune,
+                    keep_existing_reparam=preexisting_reparam
+                )
+                print(f"[WARNING] Whole-model pruning failed after task {task_id}: {e}")
+            return
+
+        if self.pruning_scope not in {'older_adapters_only', 'all_adapters'}:
+            print(
+                f"[WARNING] Unsupported pruning scope '{self.pruning_scope}'. "
+                "Falling back to 'whole_model'."
+            )
+            self.pruning_scope = 'whole_model'
+            self._auto_prune_network_end_of_task(task_id)
+            return
+
+        candidates = self._collect_prunable_adapter_candidates()
+        if not candidates:
+            print(
+                f"No removable adapters found for scope '{self.pruning_scope}' at task {task_id} "
+                "(current-task adapters are protected)."
+            )
+            return
+
+        before_effective = self._get_effective_model_params()
+        total_candidate_params = int(sum(c['adapter_params'] for c in candidates))
+        if total_candidate_params <= 0:
+            print(f"No removable adapter parameters available at task {task_id}")
+            return
+
+        target_prune_params = int(total_candidate_params * prune_amount)
+        if prune_amount > 0.0:
+            target_prune_params = max(1, target_prune_params)
+
+        candidates_sorted = sorted(candidates, key=lambda c: c['score'])
+        selected = []
+        removed_param_budget = 0
+        for candidate in candidates_sorted:
+            if removed_param_budget >= target_prune_params:
+                break
+            selected.append(candidate)
+            removed_param_budget += int(candidate['adapter_params'])
+
+        if not selected:
+            print(f"No adapters selected for pruning at task {task_id}")
+            return
+
+        try:
+            indices_by_block = {}
+            for item in selected:
+                key = (item['layer_name'], item['block_idx'])
+                if key not in indices_by_block:
+                    indices_by_block[key] = []
+                indices_by_block[key].append(int(item['adapter_idx']))
+
+            removed_params = 0
+            removed_adapters = 0
+
+            for (layer_name, block_idx), adapter_indices in indices_by_block.items():
+                layer = getattr(self.model, layer_name)
+                block = layer[block_idx]
+                adapters = getattr(block, 'adapters', None)
+                if adapters is None or len(adapters) == 0:
+                    continue
+
+                keep_adapters = []
+                remove_set = set(adapter_indices)
+                for idx, adapter in enumerate(adapters):
+                    if idx in remove_set:
+                        removed_adapters += 1
+                        removed_params += int(sum(p.numel() for p in adapter.parameters()))
+                    else:
+                        keep_adapters.append(adapter)
+
+                block.adapters = nn.ModuleList(keep_adapters)
+
+            after_effective = self._get_effective_model_params()
+            pruned_now = max(0, before_effective - after_effective)
+
+            # Keep tracking set aligned after structural deletions.
+            self.current_task_new_adapter_ids = {
+                adapter_id for adapter_id in self.current_task_new_adapter_ids
+                if any(id(adapter) == adapter_id for _, _, adapter in self._iter_adapters())
+            }
+
+            self.pruning_history.append({
+                'task_id': int(task_id),
+                'scope': self.pruning_scope,
+                'amount': float(prune_amount),
+                'effective_params_before': int(before_effective),
+                'effective_params_after': int(after_effective),
+                'pruned_params': int(pruned_now),
+                'removed_params': int(removed_params),
+                'removed_adapters': int(removed_adapters),
+                'candidate_params': int(total_candidate_params),
+                'target_prune_params': int(target_prune_params)
+            })
+
+            print(
+                f"Auto-pruned at end of task {task_id}: "
+                f"scope={self.pruning_scope}, amount={prune_amount:.4f}, "
+                f"effective params {before_effective:,} -> {after_effective:,} "
+                f"(freed {pruned_now:,}, removed_adapters={removed_adapters}, "
+                f"removed_params={removed_params:,})"
+            )
+        except Exception as e:
+            print(f"[WARNING] Auto network pruning failed after task {task_id}: {e}")
+
     def _resolve_location_for_dataset_index(self, dataset, idx: int):
         """Resolve location string for an index from wrapped/concat/subset datasets."""
         if hasattr(dataset, 'get_location'):
@@ -751,8 +1063,8 @@ class ContinualLearner:
         model_stats = compute_model_size(self.model)
         buffer_memory = self.replay_buffer.get_memory_size()
         self.metrics.update_memory(model_stats['total_mb'] + buffer_memory)
-        
-        self.metrics.update_num_parameters(int(model_stats['num_params']))
+
+        self.metrics.update_num_parameters(self._get_effective_model_params())
     def _estimate_expand_layer_params_delta(self, layer_name: str) -> int:
         """
         Estimate parameter increase for one expand_layer action.
@@ -795,7 +1107,8 @@ class ContinualLearner:
             'metrics': self.metrics,
             'config': self.config,
             'task_expansions': self.task_expansions,
-            'expansion_history': self.expansion_history
+            'expansion_history': self.expansion_history,
+            'pruning_history': self.pruning_history
         }, path)
 
     def load_checkpoint(self, path: str):
@@ -804,6 +1117,7 @@ class ContinualLearner:
         self.metrics = checkpoint['metrics']
         self.task_expansions = checkpoint.get('task_expansions', {})
         self.expansion_history = checkpoint.get('expansion_history', [])
+        self.pruning_history = checkpoint.get('pruning_history', [])
 
 def create_trainer(config: Dict, model, replay_buffer, device='cuda', use_amca=False):
     return ContinualLearner(
