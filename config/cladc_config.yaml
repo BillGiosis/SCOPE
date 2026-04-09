@@ -49,8 +49,18 @@ network_expansion:
 
 network_pruning:
   enabled: true
-  amount: 0.02  # Fraction pruned at task end (applied by scope)
+  amount: 0.02  # Maximum fraction pruned at task end (applied by scope)
+  budget_driven: true  # Prune only as needed to reopen next-task expansion budget
+  min_amount: 0.0
+  max_amount: 0.02
   scope: "whole_model"  # Options: "whole_model", "older_adapters_only", or "all_adapters"
+  protect_current_task_adapters: true
+  protect_classifier: true
+  protect_downsample: true
+  recovery:
+    enabled: true
+    epochs: 2
+    learning_rate_scale: 0.25
 
 logging:
   save_dir: "./checkpoints/cladc"

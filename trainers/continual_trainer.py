@@ -97,6 +97,27 @@ class ContinualLearner:
         self.pruning_enabled = pruning_cfg.get('enabled', False)
         self.pruning_amount = float(pruning_cfg.get('amount', 0.0))
         self.pruning_scope = str(pruning_cfg.get('scope', 'whole_model')).strip().lower()
+        self.pruning_budget_driven = bool(pruning_cfg.get('budget_driven', True))
+        self.pruning_min_amount = float(pruning_cfg.get('min_amount', 0.0))
+        self.pruning_max_amount = float(pruning_cfg.get('max_amount', self.pruning_amount))
+
+        self.protect_current_task_adapters = bool(
+            pruning_cfg.get('protect_current_task_adapters', True)
+        )
+        self.protect_classifier = bool(pruning_cfg.get('protect_classifier', True))
+        self.protect_downsample = bool(pruning_cfg.get('protect_downsample', True))
+
+        recovery_cfg = pruning_cfg.get('recovery', {})
+        self.prune_recovery_enabled = bool(recovery_cfg.get('enabled', True))
+        self.prune_recovery_epochs = max(0, int(recovery_cfg.get('epochs', 2)))
+        self.prune_recovery_lr_scale = float(recovery_cfg.get('learning_rate_scale', 0.25))
+
+        self.pruning_amount = min(max(self.pruning_amount, 0.0), 1.0)
+        self.pruning_min_amount = min(max(self.pruning_min_amount, 0.0), 1.0)
+        self.pruning_max_amount = min(max(self.pruning_max_amount, 0.0), 1.0)
+        if self.pruning_max_amount < self.pruning_min_amount:
+            self.pruning_max_amount = self.pruning_min_amount
+        self.prune_recovery_lr_scale = max(self.prune_recovery_lr_scale, 0.0)
 
         base_params = int(self._get_effective_model_params())
         max_ratio = float(config.get('benchmark', {}).get('max_params_ratio', 1.05))
@@ -154,6 +175,87 @@ class ContinualLearner:
         """Return remaining parameter budget before reaching max_params."""
         current_params = self._get_effective_model_params()
         return max(0, int(self.max_params - current_params))
+
+    def _estimate_budget_needed_for_next_task_expansion(self) -> int:
+        """
+        Estimate how much free budget is needed to make the next expansion step feasible.
+
+        - all_layers: enough for one full pass over eligible layers.
+        - layer2_layer3_split: enough for both layer2 and layer3.
+        """
+        if not self.expansion_enabled:
+            return 0
+
+        layers = list(self.expansion_layer_order)
+        if not layers:
+            return 0
+
+        costs = []
+        for layer_name in layers:
+            delta = int(self._estimate_expand_layer_params_delta(layer_name))
+            if delta > 0:
+                costs.append(delta)
+
+        if not costs:
+            return 0
+
+        if self.expansion_strategy in {'all_layers', 'layer2_layer3_split'}:
+            return int(sum(costs))
+
+        return int(sum(costs))
+
+    def _resolve_budget_driven_prune_amount(
+        self,
+        prunable_effective_params: int,
+        task_id: int
+    ) -> float:
+        """Resolve pruning amount, optionally driven by next-task budget requirements."""
+        configured_amount = min(max(float(self.pruning_amount), 0.0), 1.0)
+        if configured_amount <= 0.0:
+            return 0.0
+
+        if prunable_effective_params <= 0:
+            return 0.0
+
+        if not self.pruning_budget_driven:
+            return configured_amount
+
+        target_budget = self._estimate_budget_needed_for_next_task_expansion()
+        if target_budget <= 0:
+            print(
+                f"Budget-driven pruning skipped at task {task_id}: "
+                "no next-task expansion pressure detected"
+            )
+            return 0.0
+
+        available_budget = self._get_available_param_budget()
+        missing_budget = max(0, target_budget - available_budget)
+        if missing_budget <= 0:
+            print(
+                f"Budget-driven pruning skipped at task {task_id}: "
+                f"available budget {available_budget:,} already meets target {target_budget:,}"
+            )
+            return 0.0
+
+        required_fraction = float(missing_budget) / float(max(1, prunable_effective_params))
+        resolved_amount = max(self.pruning_min_amount, required_fraction)
+        resolved_amount = min(self.pruning_max_amount, resolved_amount)
+        resolved_amount = min(max(resolved_amount, 0.0), 1.0)
+
+        estimated_freed = int(prunable_effective_params * resolved_amount)
+        if estimated_freed < missing_budget:
+            print(
+                f"Budget-driven pruning at task {task_id} is capped by max_amount={self.pruning_max_amount:.4f}: "
+                f"needed~{missing_budget:,}, estimated_freed~{estimated_freed:,}"
+            )
+        else:
+            print(
+                f"Budget-driven pruning at task {task_id}: "
+                f"needed~{missing_budget:,}, prunable={prunable_effective_params:,}, "
+                f"resolved_amount={resolved_amount:.4f}"
+            )
+
+        return resolved_amount
 
     def _get_all_layers_budget_aware_targets(self) -> List[str]:
         """
@@ -324,7 +426,11 @@ class ContinualLearner:
             print(f"Error expanding {layer_name}: {e}")
             return False
         
-    def _create_optimizer(self, learning_rate: Optional[float] = None):
+    def _create_optimizer(
+        self,
+        learning_rate: Optional[float] = None,
+        scheduler_tmax: Optional[int] = None
+    ):
         """Create optimizer for current trainable parameters."""
         lr = self.learning_rate if learning_rate is None else learning_rate
         use_fused = (self.device == 'cuda')
@@ -344,11 +450,13 @@ class ContinualLearner:
             eps=1e-8,
             **extra_args
         )
+
+        t_max = self.epochs_per_task if scheduler_tmax is None else max(1, int(scheduler_tmax))
         
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, 
-            T_max=self.epochs_per_task,
-            eta_min=self.learning_rate * 0.01
+            T_max=t_max,
+            eta_min=lr * 0.01
         )
 
     def train_task(self, task_id: int, train_loader: DataLoader, test_loaders: List[DataLoader]):
@@ -460,7 +568,8 @@ class ContinualLearner:
 
         # Automatically distill replay memory at each chronological task boundary.
         self._auto_distill_replay_buffer_end_of_task(task_id)
-        self._auto_prune_network_end_of_task(task_id)
+        prune_applied = self._auto_prune_network_end_of_task(task_id)
+        self._post_prune_recovery(task_id, train_loader, prune_applied)
         
         # Final Full Evaluation
         print(f"\nFinal evaluation after task {task_id}:")
@@ -692,6 +801,41 @@ class ContinualLearner:
         except Exception as e:
             print(f"[WARNING] Auto replay-buffer distillation failed after task {task_id}: {e}")
 
+    def _post_prune_recovery(self, task_id: int, train_loader: DataLoader, prune_applied: bool):
+        """Run a short recovery fine-tuning phase after pruning to stabilize accuracy."""
+        if not prune_applied:
+            return
+        if not self.prune_recovery_enabled:
+            return
+        if self.prune_recovery_epochs <= 0:
+            return
+
+        recovery_lr = max(self.learning_rate * self.prune_recovery_lr_scale, 1e-8)
+
+        print(f"\n--- Post-Prune Recovery (Task {task_id}) ---")
+        print(
+            f"Recovery epochs={self.prune_recovery_epochs}, "
+            f"learning_rate={recovery_lr:.6g}"
+        )
+
+        # Avoid stale compiled graphs for the short recovery pass.
+        self.train_model = self.model
+        self._create_optimizer(
+            learning_rate=recovery_lr,
+            scheduler_tmax=self.prune_recovery_epochs
+        )
+
+        for recovery_epoch in range(self.prune_recovery_epochs):
+            display_epoch = self.epochs_per_task + recovery_epoch
+            self._train_epoch(
+                task_id=task_id,
+                train_loader=train_loader,
+                epoch=display_epoch,
+                collection_dict=None
+            )
+
+        print("Post-prune recovery complete")
+
     def _collect_prunable_adapter_candidates(self) -> List[Dict]:
         """Collect removable adapter candidates while excluding adapters added in current task."""
         candidates = []
@@ -738,23 +882,58 @@ class ContinualLearner:
         remain untouched at this task boundary.
         """
         protected_module_ids = set()
-        for _, _, adapter in self._iter_adapters():
-            if id(adapter) not in self.current_task_new_adapter_ids:
-                continue
-            for m in adapter.modules():
-                protected_module_ids.add(id(m))
+        if self.protect_current_task_adapters:
+            for _, _, adapter in self._iter_adapters():
+                if id(adapter) not in self.current_task_new_adapter_ids:
+                    continue
+                for m in adapter.modules():
+                    protected_module_ids.add(id(m))
 
         modules_to_prune = []
-        for module in self.model.modules():
+        for module_name, module in self.model.named_modules():
             if not isinstance(module, (nn.Conv2d, nn.Linear)):
                 continue
             if not hasattr(module, 'weight'):
                 continue
             if id(module) in protected_module_ids:
                 continue
+
+            if self.protect_classifier and module_name == 'fc':
+                continue
+
+            if self.protect_downsample and 'downsample' in module_name:
+                continue
+
             modules_to_prune.append((module, 'weight'))
 
         return modules_to_prune
+
+    def _get_effective_entries_for_parameter(self, module: nn.Module, param_name: str) -> int:
+        """Count active entries for one potentially pruned parameter tensor."""
+        orig_name = f"{param_name}_orig"
+        mask_name = f"{param_name}_mask"
+
+        if hasattr(module, orig_name) and hasattr(module, mask_name):
+            mask = getattr(module, mask_name)
+            return int(mask.sum().item())
+
+        if hasattr(module, param_name):
+            tensor = getattr(module, param_name)
+            if isinstance(tensor, nn.Parameter):
+                return int(tensor.numel())
+            if torch.is_tensor(tensor):
+                return int(tensor.numel())
+
+        return 0
+
+    def _count_prunable_dense_effective_params(self, modules_to_prune: List[tuple]) -> int:
+        """Count active entries across all dense parameters eligible for pruning."""
+        return int(
+            sum(
+                self._get_effective_entries_for_parameter(module, param_name)
+                for module, param_name in modules_to_prune
+            )
+        )
 
     def _prepare_modules_for_unstructured_pruning(self, modules_to_prune: List[tuple]):
         """
@@ -795,15 +974,10 @@ class ContinualLearner:
                 # Keep cleanup best-effort; original prune exception is reported upstream.
                 pass
 
-    def _auto_prune_network_end_of_task(self, task_id: int):
+    def _auto_prune_network_end_of_task(self, task_id: int) -> bool:
         """Apply network pruning after replay-buffer distillation at each task boundary."""
         if not self.pruning_enabled:
-            return
-
-        prune_amount = min(max(float(self.pruning_amount), 0.0), 1.0)
-        if prune_amount <= 0.0:
-            print(f"Pruning enabled but amount is {prune_amount}; skipping at task {task_id}")
-            return
+            return False
 
         if self.pruning_scope == 'whole_model':
             modules_to_prune = self._collect_prunable_dense_parameters()
@@ -812,7 +986,19 @@ class ContinualLearner:
                     f"No eligible whole-model parameters found at task {task_id} "
                     "(current-task adapters are protected)."
                 )
-                return
+                return False
+
+            prunable_effective = self._count_prunable_dense_effective_params(modules_to_prune)
+            if prunable_effective <= 0:
+                print(f"No active dense parameters available to prune at task {task_id}")
+                return False
+
+            prune_amount = self._resolve_budget_driven_prune_amount(
+                prunable_effective_params=prunable_effective,
+                task_id=task_id
+            )
+            if prune_amount <= 0.0:
+                return False
 
             before_effective = self._get_effective_model_params()
             preexisting_reparam = set()
@@ -856,13 +1042,14 @@ class ContinualLearner:
                     f"effective params {before_effective:,} -> {after_effective:,} "
                     f"(freed {pruned_now:,})"
                 )
+                return True
             except Exception as e:
                 self._remove_pruning_reparam_if_present(
                     modules_to_prune,
                     keep_existing_reparam=preexisting_reparam
                 )
                 print(f"[WARNING] Whole-model pruning failed after task {task_id}: {e}")
-            return
+                return False
 
         if self.pruning_scope not in {'older_adapters_only', 'all_adapters'}:
             print(
@@ -870,8 +1057,7 @@ class ContinualLearner:
                 "Falling back to 'whole_model'."
             )
             self.pruning_scope = 'whole_model'
-            self._auto_prune_network_end_of_task(task_id)
-            return
+            return self._auto_prune_network_end_of_task(task_id)
 
         candidates = self._collect_prunable_adapter_candidates()
         if not candidates:
@@ -879,13 +1065,20 @@ class ContinualLearner:
                 f"No removable adapters found for scope '{self.pruning_scope}' at task {task_id} "
                 "(current-task adapters are protected)."
             )
-            return
+            return False
 
         before_effective = self._get_effective_model_params()
         total_candidate_params = int(sum(c['adapter_params'] for c in candidates))
         if total_candidate_params <= 0:
             print(f"No removable adapter parameters available at task {task_id}")
-            return
+            return False
+
+        prune_amount = self._resolve_budget_driven_prune_amount(
+            prunable_effective_params=total_candidate_params,
+            task_id=task_id
+        )
+        if prune_amount <= 0.0:
+            return False
 
         target_prune_params = int(total_candidate_params * prune_amount)
         if prune_amount > 0.0:
@@ -902,7 +1095,7 @@ class ContinualLearner:
 
         if not selected:
             print(f"No adapters selected for pruning at task {task_id}")
-            return
+            return False
 
         try:
             indices_by_block = {}
@@ -962,8 +1155,10 @@ class ContinualLearner:
                 f"(freed {pruned_now:,}, removed_adapters={removed_adapters}, "
                 f"removed_params={removed_params:,})"
             )
+            return True
         except Exception as e:
             print(f"[WARNING] Auto network pruning failed after task {task_id}: {e}")
+            return False
 
     def _resolve_location_for_dataset_index(self, dataset, idx: int):
         """Resolve location string for an index from wrapped/concat/subset datasets."""
