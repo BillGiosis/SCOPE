@@ -9,6 +9,11 @@ import time
 import os
 import sys
 
+try:
+    import torch_pruning as tp
+except ImportError:
+    tp = None
+
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
@@ -97,9 +102,20 @@ class ContinualLearner:
         self.pruning_enabled = pruning_cfg.get('enabled', False)
         self.pruning_amount = float(pruning_cfg.get('amount', 0.0))
         self.pruning_scope = str(pruning_cfg.get('scope', 'whole_model')).strip().lower()
+        self.pruning_method = str(pruning_cfg.get('method', 'structural')).strip().lower()
+        self.pruning_warmup_tasks = max(0, int(pruning_cfg.get('warmup_tasks', 2)))
         self.pruning_budget_driven = bool(pruning_cfg.get('budget_driven', True))
         self.pruning_min_amount = float(pruning_cfg.get('min_amount', 0.0))
         self.pruning_max_amount = float(pruning_cfg.get('max_amount', self.pruning_amount))
+        self.pruning_example_input_shape = tuple(
+            pruning_cfg.get('example_input_shape', [1, 3, 224, 224])
+        )
+        self.rebuild_optimizer_after_prune = bool(
+            pruning_cfg.get('rebuild_optimizer_after_prune', True)
+        )
+        self.recompile_after_prune = bool(
+            pruning_cfg.get('recompile_after_prune', True)
+        )
 
         self.protect_current_task_adapters = bool(
             pruning_cfg.get('protect_current_task_adapters', True)
@@ -109,8 +125,8 @@ class ContinualLearner:
 
         recovery_cfg = pruning_cfg.get('recovery', {})
         self.prune_recovery_enabled = bool(recovery_cfg.get('enabled', True))
-        self.prune_recovery_epochs = max(0, int(recovery_cfg.get('epochs', 2)))
-        self.prune_recovery_lr_scale = float(recovery_cfg.get('learning_rate_scale', 0.25))
+        self.prune_recovery_epochs = max(0, int(recovery_cfg.get('epochs', 4)))
+        self.prune_recovery_lr_scale = float(recovery_cfg.get('learning_rate_scale', 0.2))
 
         self.pruning_amount = min(max(self.pruning_amount, 0.0), 1.0)
         self.pruning_min_amount = min(max(self.pruning_min_amount, 0.0), 1.0)
@@ -118,6 +134,8 @@ class ContinualLearner:
         if self.pruning_max_amount < self.pruning_min_amount:
             self.pruning_max_amount = self.pruning_min_amount
         self.prune_recovery_lr_scale = max(self.prune_recovery_lr_scale, 0.0)
+        if len(self.pruning_example_input_shape) != 4:
+            self.pruning_example_input_shape = (1, 3, 224, 224)
 
         base_params = int(self._get_effective_model_params())
         max_ratio = float(config.get('benchmark', {}).get('max_params_ratio', 1.05))
@@ -377,6 +395,94 @@ class ContinualLearner:
                 for adapter in adapters:
                     yield layer_name, block_idx, adapter
 
+    def _get_pruning_example_input(self, train_loader: Optional[DataLoader] = None) -> Optional[torch.Tensor]:
+        """Build example input for graph-based structural pruning."""
+        if train_loader is not None:
+            try:
+                first_batch = next(iter(train_loader))
+                images = None
+
+                if isinstance(first_batch, (tuple, list)) and len(first_batch) > 0:
+                    if torch.is_tensor(first_batch[0]):
+                        images = first_batch[0]
+                elif isinstance(first_batch, dict):
+                    candidate = first_batch.get('images', None)
+                    if torch.is_tensor(candidate):
+                        images = candidate
+
+                if images is not None and images.ndim >= 4 and images.size(0) > 0:
+                    example = images[:1].to(self.device, non_blocking=True)
+                    if self.device == 'cuda':
+                        example = example.contiguous(memory_format=torch.channels_last)
+                    return example
+            except Exception as e:
+                print(f"[WARNING] Could not derive pruning example input from loader: {e}")
+
+        try:
+            shape = tuple(int(v) for v in self.pruning_example_input_shape)
+            example = torch.randn(*shape, device=self.device)
+            if self.device == 'cuda':
+                example = example.contiguous(memory_format=torch.channels_last)
+            return example
+        except Exception as e:
+            print(f"[WARNING] Could not create fallback pruning example input: {e}")
+            return None
+
+    def _collect_structural_pruning_ignored_layers(self) -> List[nn.Module]:
+        """Collect strict protection list for structural pruning."""
+        ignored_layers = []
+        ignored_ids = set()
+
+        for module_name, module in self.model.named_modules():
+            should_ignore = False
+
+            if self.protect_classifier and module_name == 'fc':
+                should_ignore = True
+
+            if self.protect_downsample and 'downsample' in module_name:
+                should_ignore = True
+
+            if should_ignore and id(module) not in ignored_ids:
+                ignored_layers.append(module)
+                ignored_ids.add(id(module))
+
+        if self.protect_current_task_adapters:
+            for _, _, adapter in self._iter_adapters():
+                if id(adapter) not in self.current_task_new_adapter_ids:
+                    continue
+                for m in adapter.modules():
+                    if not isinstance(m, (nn.Conv2d, nn.Linear, nn.BatchNorm2d, nn.BatchNorm1d)):
+                        continue
+                    if id(m) in ignored_ids:
+                        continue
+                    ignored_layers.append(m)
+                    ignored_ids.add(id(m))
+
+        return ignored_layers
+
+    def _refresh_training_state_after_prune(
+        self,
+        task_id: int,
+        learning_rate: Optional[float] = None,
+        scheduler_tmax: Optional[int] = None
+    ):
+        """Refresh optimizer and compiled training graph after structural pruning."""
+        if self.rebuild_optimizer_after_prune:
+            self._create_optimizer(
+                learning_rate=learning_rate,
+                scheduler_tmax=scheduler_tmax
+            )
+            print(f"Rebuilt optimizer after pruning for task {task_id}")
+
+        self.train_model = self.model
+        if self.recompile_after_prune and self.use_torch_compile:
+            try:
+                self.train_model = torch.compile(self.model)
+                print(f"Recompiled training model after pruning for task {task_id}")
+            except Exception as e:
+                print(f"Could not recompile training model after pruning for task {task_id}: {e}")
+                self.train_model = self.model
+
     def _prepare_training_model_for_task(self, task_id: int):
         """Compile a training-only model once per task after expansion."""
         self.train_model = self.model
@@ -568,7 +674,7 @@ class ContinualLearner:
 
         # Automatically distill replay memory at each chronological task boundary.
         self._auto_distill_replay_buffer_end_of_task(task_id)
-        prune_applied = self._auto_prune_network_end_of_task(task_id)
+        prune_applied = self._auto_prune_network_end_of_task(task_id, train_loader=train_loader)
         self._post_prune_recovery(task_id, train_loader, prune_applied)
         
         # Final Full Evaluation
@@ -617,9 +723,14 @@ class ContinualLearner:
         for batch_idx, (images, labels) in pbar:
             try:
                 if self.device == 'cuda':
-                    images = images.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                    images = images.to(
+                        self.device,
+                        dtype=torch.float32,
+                        non_blocking=True,
+                        memory_format=torch.channels_last
+                    )
                 else:
-                    images = images.to(self.device, non_blocking=True)
+                    images = images.to(self.device, dtype=torch.float32, non_blocking=True)
                 
                 labels = labels.to(self.device, non_blocking=True)
                 
@@ -654,9 +765,18 @@ class ContinualLearner:
                     
                     if replay_batch is not None:
                         if self.device == 'cuda':
-                            r_imgs = replay_batch['images'].to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                            r_imgs = replay_batch['images'].to(
+                                self.device,
+                                dtype=torch.float32,
+                                non_blocking=True,
+                                memory_format=torch.channels_last
+                            )
                         else:
-                            r_imgs = replay_batch['images'].to(self.device, non_blocking=True)
+                            r_imgs = replay_batch['images'].to(
+                                self.device,
+                                dtype=torch.float32,
+                                non_blocking=True
+                            )
                         
                         r_lbls = replay_batch['labels'].to(self.device, non_blocking=True)
                         
@@ -805,24 +925,25 @@ class ContinualLearner:
         """Run a short recovery fine-tuning phase after pruning to stabilize accuracy."""
         if not prune_applied:
             return
+
+        recovery_lr = max(self.learning_rate * self.prune_recovery_lr_scale, 1e-8)
+        recovery_tmax = max(1, self.prune_recovery_epochs)
+
+        self._refresh_training_state_after_prune(
+            task_id=task_id,
+            learning_rate=recovery_lr,
+            scheduler_tmax=recovery_tmax
+        )
+
         if not self.prune_recovery_enabled:
             return
         if self.prune_recovery_epochs <= 0:
             return
 
-        recovery_lr = max(self.learning_rate * self.prune_recovery_lr_scale, 1e-8)
-
         print(f"\n--- Post-Prune Recovery (Task {task_id}) ---")
         print(
             f"Recovery epochs={self.prune_recovery_epochs}, "
             f"learning_rate={recovery_lr:.6g}"
-        )
-
-        # Avoid stale compiled graphs for the short recovery pass.
-        self.train_model = self.model
-        self._create_optimizer(
-            learning_rate=recovery_lr,
-            scheduler_tmax=self.prune_recovery_epochs
         )
 
         for recovery_epoch in range(self.prune_recovery_epochs):
@@ -974,10 +1095,119 @@ class ContinualLearner:
                 # Keep cleanup best-effort; original prune exception is reported upstream.
                 pass
 
-    def _auto_prune_network_end_of_task(self, task_id: int) -> bool:
+    def _auto_structural_prune_whole_model(
+        self,
+        task_id: int,
+        train_loader: Optional[DataLoader] = None
+    ) -> bool:
+        """Apply physical channel/filter pruning for whole-model mode."""
+        if tp is None:
+            print(
+                "[WARNING] Structural pruning requested but 'torch_pruning' is not available. "
+                "Install torch-pruning or use network_pruning.method='unstructured'."
+            )
+            return False
+
+        modules_to_prune = self._collect_prunable_dense_parameters()
+        if not modules_to_prune:
+            print(
+                f"No eligible whole-model parameters found at task {task_id} "
+                "(current-task adapters are protected)."
+            )
+            return False
+
+        prunable_effective = self._count_prunable_dense_effective_params(modules_to_prune)
+        if prunable_effective <= 0:
+            print(f"No active dense parameters available to prune at task {task_id}")
+            return False
+
+        prune_amount = self._resolve_budget_driven_prune_amount(
+            prunable_effective_params=prunable_effective,
+            task_id=task_id
+        )
+        if prune_amount <= 0.0:
+            return False
+
+        example_inputs = self._get_pruning_example_input(train_loader=train_loader)
+        if example_inputs is None:
+            print(f"[WARNING] No valid example input available for structural pruning at task {task_id}")
+            return False
+
+        ignored_layers = self._collect_structural_pruning_ignored_layers()
+        before_effective = self._get_effective_model_params()
+        before_total = int(self.model.get_num_parameters()) if hasattr(self.model, 'get_num_parameters') else int(sum(p.numel() for p in self.model.parameters()))
+
+        try:
+            self.model.eval()
+            with torch.no_grad():
+                _ = self.model(example_inputs)
+
+            importance = tp.importance.MagnitudeImportance(p=1)
+            pruner = tp.pruner.MagnitudePruner(
+                self.model,
+                example_inputs=example_inputs,
+                importance=importance,
+                pruning_ratio=float(prune_amount),
+                ignored_layers=ignored_layers,
+            )
+            pruner.step()
+
+            if self.device == 'cuda':
+                torch.cuda.empty_cache()
+
+            after_effective = self._get_effective_model_params()
+            after_total = int(self.model.get_num_parameters()) if hasattr(self.model, 'get_num_parameters') else int(sum(p.numel() for p in self.model.parameters()))
+            pruned_now = max(0, before_effective - after_effective)
+            total_removed = max(0, before_total - after_total)
+
+            self.pruning_history.append({
+                'task_id': int(task_id),
+                'scope': self.pruning_scope,
+                'method': 'structural',
+                'amount': float(prune_amount),
+                'effective_params_before': int(before_effective),
+                'effective_params_after': int(after_effective),
+                'pruned_params': int(pruned_now),
+                'total_params_before': int(before_total),
+                'total_params_after': int(after_total),
+                'total_removed_params': int(total_removed),
+                'ignored_layers': int(len(ignored_layers)),
+                'example_input_shape': list(example_inputs.shape)
+            })
+
+            print(
+                f"Auto-structural-pruned whole model at end of task {task_id}: "
+                f"amount={prune_amount:.4f}, ignored_layers={len(ignored_layers)}, "
+                f"effective params {before_effective:,} -> {after_effective:,}, "
+                f"total params {before_total:,} -> {after_total:,} "
+                f"(freed {pruned_now:,} effective / {total_removed:,} physical)"
+            )
+            return True
+        except Exception as e:
+            print(f"[WARNING] Structural whole-model pruning failed after task {task_id}: {e}")
+            return False
+
+    def _auto_prune_network_end_of_task(
+        self,
+        task_id: int,
+        train_loader: Optional[DataLoader] = None
+    ) -> bool:
         """Apply network pruning after replay-buffer distillation at each task boundary."""
         if not self.pruning_enabled:
             return False
+
+        if task_id < self.pruning_warmup_tasks:
+            print(
+                f"Skipping pruning at task {task_id}: warmup active "
+                f"(warmup_tasks={self.pruning_warmup_tasks})"
+            )
+            return False
+
+        if self.pruning_scope == 'whole_model' and self.pruning_method == 'structural':
+            return self._auto_structural_prune_whole_model(
+                task_id=task_id,
+                train_loader=train_loader
+            )
 
         if self.pruning_scope == 'whole_model':
             modules_to_prune = self._collect_prunable_dense_parameters()
@@ -1028,6 +1258,7 @@ class ContinualLearner:
                 self.pruning_history.append({
                     'task_id': int(task_id),
                     'scope': self.pruning_scope,
+                    'method': 'unstructured',
                     'amount': float(prune_amount),
                     'effective_params_before': int(before_effective),
                     'effective_params_after': int(after_effective),
@@ -1057,7 +1288,7 @@ class ContinualLearner:
                 "Falling back to 'whole_model'."
             )
             self.pruning_scope = 'whole_model'
-            return self._auto_prune_network_end_of_task(task_id)
+            return self._auto_prune_network_end_of_task(task_id, train_loader=train_loader)
 
         candidates = self._collect_prunable_adapter_candidates()
         if not candidates:
@@ -1138,6 +1369,7 @@ class ContinualLearner:
             self.pruning_history.append({
                 'task_id': int(task_id),
                 'scope': self.pruning_scope,
+                'method': 'adapter_delete',
                 'amount': float(prune_amount),
                 'effective_params_before': int(before_effective),
                 'effective_params_after': int(after_effective),

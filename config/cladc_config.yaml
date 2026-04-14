@@ -34,7 +34,7 @@ replay_buffer:
   distillation_temp: 1.5
   replay_batch_size: 32
   auto_distill_end_of_task: true  # Distill automatically at each task boundary
-  end_of_task_distill_compression_ratio: 0.9  # Keep top 90% by entropy importance
+  end_of_task_distill_compression_ratio: 0.96  # Keep top 96% by entropy importance
 
 data_loading:
   num_workers: 8  # Parallel data loading
@@ -49,18 +49,27 @@ network_expansion:
 
 network_pruning:
   enabled: true
-  amount: 0.02  # Maximum fraction pruned at task end (applied by scope)
+  amount: 0.01  # Maximum fraction pruned at task end (applied by scope)
+  warmup_tasks: 2  # Do not prune during first N tasks to protect early AMCA
   budget_driven: true  # Prune only as needed to reopen next-task expansion budget
   min_amount: 0.0
-  max_amount: 0.02
+  max_amount: 0.01
   scope: "whole_model"  # Options: "whole_model", "older_adapters_only", or "all_adapters"
+  method: "structural"  # Options: "structural" (torch-pruning) or "unstructured"
+  rebuild_optimizer_after_prune: true
+  recompile_after_prune: true
+  example_input_shape: [1, 3, 224, 224]
   protect_current_task_adapters: true
   protect_classifier: true
   protect_downsample: true
   recovery:
     enabled: true
-    epochs: 2
-    learning_rate_scale: 0.25
+    epochs: 5
+    learning_rate_scale: 0.18
+  validation:
+    report_efficiency_metrics: true
+    latency_warmup_runs: 5
+    latency_runs: 20
 
 logging:
   save_dir: "./checkpoints/cladc"

@@ -26,6 +26,7 @@ from models.expandable_resnet import create_expandable_resnet
 from buffers.replay_buffer import ReplayBuffer
 from benchmarks.cladc import create_cladc_benchmark
 from trainers.continual_trainer import create_trainer
+from utils.metrics import compute_inference_efficiency
 
 
 def load_config(config_path: str) -> dict:
@@ -33,6 +34,35 @@ def load_config(config_path: str) -> dict:
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
+
+
+def infer_input_shape_from_loaders(loaders, fallback=(1, 3, 224, 224)):
+    """Infer a representative NCHW input shape from available dataloaders."""
+    if not loaders:
+        return fallback
+
+    for loader in loaders:
+        if loader is None:
+            continue
+        try:
+            batch = next(iter(loader))
+        except Exception:
+            continue
+
+        images = None
+        if isinstance(batch, (tuple, list)) and len(batch) > 0 and torch.is_tensor(batch[0]):
+            images = batch[0]
+        elif isinstance(batch, dict):
+            candidate = batch.get('images', None)
+            if torch.is_tensor(candidate):
+                images = candidate
+
+        if images is None or images.ndim < 4:
+            continue
+
+        return (1, int(images.shape[1]), int(images.shape[2]), int(images.shape[3]))
+
+    return fallback
 
 
 def main(args):
@@ -99,14 +129,42 @@ def main(args):
     print(f"{'='*60}\n")
     
     num_tasks = config['benchmark']['num_tasks']
+    last_test_loaders = None
     
     for task_id in range(num_tasks):
         # Get data loaders
         train_loader = benchmark.get_task_dataloader(task_id, train=True)
         test_loaders = benchmark.get_all_test_dataloaders()
+        last_test_loaders = test_loaders
         
         # Train on current task
         trainer.train_task(task_id, train_loader, test_loaders)
+
+    # Efficiency metrics (FLOPs/MACs + latency/throughput)
+    validation_cfg = pruning_cfg.get('validation', {})
+    efficiency_metrics = None
+    if validation_cfg.get('report_efficiency_metrics', True):
+        fallback_shape = tuple(pruning_cfg.get('example_input_shape', [1, 3, 224, 224]))
+        input_shape = infer_input_shape_from_loaders(last_test_loaders, fallback=fallback_shape)
+        warmup_runs = int(validation_cfg.get('latency_warmup_runs', 5))
+        latency_runs = int(validation_cfg.get('latency_runs', 20))
+        try:
+            efficiency_metrics = compute_inference_efficiency(
+                trainer.model,
+                device=args.device,
+                input_shape=input_shape,
+                warmup_runs=warmup_runs,
+                measure_runs=latency_runs
+            )
+            print(
+                "Efficiency metrics: "
+                f"MACs={efficiency_metrics['macs']:,}, "
+                f"FLOPs={efficiency_metrics['flops']:,}, "
+                f"latency={efficiency_metrics['latency_ms']:.3f} ms, "
+                f"throughput={efficiency_metrics['throughput_fps']:.2f} FPS"
+            )
+        except Exception as e:
+            print(f"[WARNING] Could not compute efficiency metrics: {e}")
     
     # Final evaluation and summary
     print(f"\n{'='*60}")
@@ -187,10 +245,15 @@ def main(args):
         f.write("Network Pruning:\n")
         f.write(f"  Enabled: {pruning_cfg.get('enabled', False)}\n")
         f.write(f"  Amount (max per task): {pruning_cfg.get('amount', 0.0)}\n")
+        f.write(f"  Warmup Tasks: {pruning_cfg.get('warmup_tasks', 2)}\n")
         f.write(f"  Budget Driven: {pruning_cfg.get('budget_driven', True)}\n")
         f.write(f"  Min Amount: {pruning_cfg.get('min_amount', 0.0)}\n")
         f.write(f"  Max Amount: {pruning_cfg.get('max_amount', pruning_cfg.get('amount', 0.0))}\n")
         f.write(f"  Scope: {pruning_cfg.get('scope', 'whole_model')}\n")
+        f.write(f"  Method: {pruning_cfg.get('method', 'structural')}\n")
+        f.write(f"  Rebuild Optimizer After Prune: {pruning_cfg.get('rebuild_optimizer_after_prune', True)}\n")
+        f.write(f"  Recompile After Prune: {pruning_cfg.get('recompile_after_prune', True)}\n")
+        f.write(f"  Example Input Shape: {pruning_cfg.get('example_input_shape', [1, 3, 224, 224])}\n")
         f.write(f"  Protect Current-Task Adapters: {pruning_cfg.get('protect_current_task_adapters', True)}\n")
         f.write(f"  Protect Classifier: {pruning_cfg.get('protect_classifier', True)}\n")
         f.write(f"  Protect Downsample: {pruning_cfg.get('protect_downsample', True)}\n")
@@ -198,6 +261,9 @@ def main(args):
         f.write(f"  Recovery Enabled: {recovery_cfg.get('enabled', True)}\n")
         f.write(f"  Recovery Epochs: {recovery_cfg.get('epochs', 2)}\n")
         f.write(f"  Recovery LR Scale: {recovery_cfg.get('learning_rate_scale', 0.25)}\n")
+        f.write(f"  Report Efficiency Metrics: {validation_cfg.get('report_efficiency_metrics', True)}\n")
+        f.write(f"  Latency Warmup Runs: {validation_cfg.get('latency_warmup_runs', 5)}\n")
+        f.write(f"  Latency Runs: {validation_cfg.get('latency_runs', 20)}\n")
         f.write("\n")
         
         f.write("="*80 + "\n\n")
@@ -281,6 +347,13 @@ def main(args):
             f.write(f"Final Memory Usage: {trainer.metrics.memory_usage[-1]:.2f} MB\n")
         if trainer.metrics.num_parameters:
             f.write(f"Final Parameters: {trainer.metrics.num_parameters[-1]:,}\n")
+        if efficiency_metrics is not None:
+            f.write(f"Approx MACs: {int(efficiency_metrics['macs']):,}\n")
+            f.write(f"Approx FLOPs: {int(efficiency_metrics['flops']):,}\n")
+            f.write(f"Inference Device: {efficiency_metrics['device']}\n")
+            f.write(f"Inference Input Shape: {efficiency_metrics['input_shape']}\n")
+            f.write(f"Inference Latency: {efficiency_metrics['latency_ms']:.3f} ms\n")
+            f.write(f"Inference Throughput: {efficiency_metrics['throughput_fps']:.2f} FPS\n")
         total_time = sum(trainer.metrics.task_times.values())
         f.write(f"Total Training Time: {total_time:.2f} seconds ({total_time/3600:.2f} hours)\n\n")
         
@@ -300,10 +373,11 @@ def main(args):
             if not entry:
                 f.write(f"  Task {task_id}: none\n")
                 continue
+            method = entry.get('method', 'unstructured')
             f.write(
                 f"  Task {task_id}: pruned={entry['pruned_params']:,}, "
                 f"effective={entry['effective_params_before']:,}->{entry['effective_params_after']:,}, "
-                f"amount={entry['amount']:.4f}, scope={entry['scope']}\n"
+                f"amount={entry['amount']:.4f}, scope={entry['scope']}, method={method}\n"
             )
         
         f.write("\n" + "="*80 + "\n")

@@ -7,6 +7,7 @@ import torch.nn as nn
 from typing import Dict, Optional, Tuple, Union
 import numpy as np
 from collections import defaultdict
+import time
 
 
 class AMCATester:
@@ -367,4 +368,126 @@ def compute_model_size(model: nn.Module) -> Dict[str, float]:
         'num_params': sum(p.numel() for p in model.parameters()),
         'num_trainable_params': sum(p.numel() for p in model.parameters() 
                                    if p.requires_grad)
+    }
+
+
+def compute_inference_efficiency(
+    model: nn.Module,
+    device: str = 'cuda',
+    input_shape: Tuple[int, int, int, int] = (1, 3, 224, 224),
+    warmup_runs: int = 5,
+    measure_runs: int = 20
+) -> Dict[str, float]:
+    """
+    Compute approximate MACs/FLOPs and measured inference latency.
+
+    FLOPs are approximated from Conv2d/Linear hooks as 2 * MACs.
+    """
+    warmup_runs = max(0, int(warmup_runs))
+    measure_runs = max(1, int(measure_runs))
+
+    if len(input_shape) != 4:
+        input_shape = (1, 3, 224, 224)
+
+    requested_cuda = str(device).startswith('cuda')
+    run_device = torch.device('cuda' if (requested_cuda and torch.cuda.is_available()) else 'cpu')
+
+    model_was_training = model.training
+    model.eval()
+
+    # Keep model on its current device unless it differs from requested run device.
+    try:
+        current_device = next(model.parameters()).device
+    except StopIteration:
+        current_device = run_device
+
+    if current_device != run_device:
+        model.to(run_device)
+    else:
+        run_device = current_device
+
+    sample = torch.randn(*input_shape, device=run_device)
+    if run_device.type == 'cuda':
+        sample = sample.contiguous(memory_format=torch.channels_last)
+
+    macs = 0
+
+    def _as_tensor(output):
+        if torch.is_tensor(output):
+            return output
+        if isinstance(output, (tuple, list)) and len(output) > 0 and torch.is_tensor(output[0]):
+            return output[0]
+        return None
+
+    def conv_hook(module, _inputs, output):
+        nonlocal macs
+        out = _as_tensor(output)
+        if out is None or out.ndim < 4:
+            return
+
+        batch = int(out.shape[0])
+        out_h = int(out.shape[-2])
+        out_w = int(out.shape[-1])
+        if isinstance(module.kernel_size, tuple):
+            k_h, k_w = module.kernel_size
+        else:
+            k_h = module.kernel_size
+            k_w = module.kernel_size
+
+        in_per_group = int(module.in_channels // module.groups)
+        macs += int(batch * module.out_channels * out_h * out_w * in_per_group * k_h * k_w)
+
+    def linear_hook(module, _inputs, output):
+        nonlocal macs
+        out = _as_tensor(output)
+        if out is None:
+            return
+
+        batch = int(out.shape[0]) if out.ndim > 1 else 1
+        macs += int(batch * module.in_features * module.out_features)
+
+    hook_handles = []
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            hook_handles.append(m.register_forward_hook(conv_hook))
+        elif isinstance(m, nn.Linear):
+            hook_handles.append(m.register_forward_hook(linear_hook))
+
+    with torch.no_grad():
+        _ = model(sample)
+
+    for h in hook_handles:
+        h.remove()
+
+    if run_device.type == 'cuda':
+        torch.cuda.synchronize(run_device)
+
+    with torch.no_grad():
+        for _ in range(warmup_runs):
+            _ = model(sample)
+
+    if run_device.type == 'cuda':
+        torch.cuda.synchronize(run_device)
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        for _ in range(measure_runs):
+            _ = model(sample)
+    if run_device.type == 'cuda':
+        torch.cuda.synchronize(run_device)
+    elapsed = time.perf_counter() - start
+
+    latency_ms = (elapsed * 1000.0) / float(measure_runs)
+    throughput_fps = 1000.0 / latency_ms if latency_ms > 0 else 0.0
+
+    if model_was_training:
+        model.train()
+
+    return {
+        'device': str(run_device),
+        'input_shape': tuple(int(v) for v in input_shape),
+        'macs': int(macs),
+        'flops': int(macs * 2),
+        'latency_ms': float(latency_ms),
+        'throughput_fps': float(throughput_fps),
     }
