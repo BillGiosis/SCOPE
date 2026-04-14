@@ -246,17 +246,27 @@ def main(args):
         f.write(f"  Enabled: {pruning_cfg.get('enabled', False)}\n")
         f.write(f"  Amount (max per task): {pruning_cfg.get('amount', 0.0)}\n")
         f.write(f"  Warmup Tasks: {pruning_cfg.get('warmup_tasks', 2)}\n")
+        f.write(f"  Pruning Interval Tasks: {pruning_cfg.get('interval_tasks', 1)}\n")
         f.write(f"  Budget Driven: {pruning_cfg.get('budget_driven', True)}\n")
         f.write(f"  Min Amount: {pruning_cfg.get('min_amount', 0.0)}\n")
         f.write(f"  Max Amount: {pruning_cfg.get('max_amount', pruning_cfg.get('amount', 0.0))}\n")
         f.write(f"  Scope: {pruning_cfg.get('scope', 'whole_model')}\n")
         f.write(f"  Method: {pruning_cfg.get('method', 'structural')}\n")
+        f.write(f"  Importance: {pruning_cfg.get('importance', 'magnitude')}\n")
+        f.write(f"  Use Replay For Taylor: {pruning_cfg.get('use_replay_for_taylor', True)}\n")
+        f.write(f"  Taylor Replay Batches: {pruning_cfg.get('taylor_replay_batches', 2)}\n")
+        f.write(f"  Taylor Train Batches: {pruning_cfg.get('taylor_train_batches', 0)}\n")
+        f.write(f"  Taylor Replay Batch Size: {pruning_cfg.get('taylor_replay_batch_size', config['replay_buffer'].get('replay_batch_size', 32))}\n")
         f.write(f"  Rebuild Optimizer After Prune: {pruning_cfg.get('rebuild_optimizer_after_prune', True)}\n")
         f.write(f"  Recompile After Prune: {pruning_cfg.get('recompile_after_prune', True)}\n")
         f.write(f"  Example Input Shape: {pruning_cfg.get('example_input_shape', [1, 3, 224, 224])}\n")
         f.write(f"  Protect Current-Task Adapters: {pruning_cfg.get('protect_current_task_adapters', True)}\n")
         f.write(f"  Protect Classifier: {pruning_cfg.get('protect_classifier', True)}\n")
         f.write(f"  Protect Downsample: {pruning_cfg.get('protect_downsample', True)}\n")
+        rollback_cfg = pruning_cfg.get('rollback', {})
+        f.write(f"  Rollback Enabled: {rollback_cfg.get('enabled', False)}\n")
+        f.write(f"  Rollback Max MCA Drop: {rollback_cfg.get('max_mca_drop', 0.01)}\n")
+        f.write(f"  Rollback Eval Max Batches: {rollback_cfg.get('eval_max_batches', 20)}\n")
         recovery_cfg = pruning_cfg.get('recovery', {})
         f.write(f"  Recovery Enabled: {recovery_cfg.get('enabled', True)}\n")
         f.write(f"  Recovery Epochs: {recovery_cfg.get('epochs', 2)}\n")
@@ -374,10 +384,14 @@ def main(args):
                 f.write(f"  Task {task_id}: none\n")
                 continue
             method = entry.get('method', 'unstructured')
+            importance = entry.get('importance', 'n/a')
+            rollback_flag = entry.get('rolled_back', False)
+            rollback_suffix = ', rollback=applied' if rollback_flag else ''
             f.write(
                 f"  Task {task_id}: pruned={entry['pruned_params']:,}, "
                 f"effective={entry['effective_params_before']:,}->{entry['effective_params_after']:,}, "
-                f"amount={entry['amount']:.4f}, scope={entry['scope']}, method={method}\n"
+                f"amount={entry['amount']:.4f}, scope={entry['scope']}, method={method}, "
+                f"importance={importance}{rollback_suffix}\n"
             )
         
         f.write("\n" + "="*80 + "\n")

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.nn.utils.prune as torch_prune
+import copy
 from torch.utils.data import DataLoader, ConcatDataset, Subset
 from typing import Dict, List, Optional
 import time
@@ -103,6 +104,20 @@ class ContinualLearner:
         self.pruning_amount = float(pruning_cfg.get('amount', 0.0))
         self.pruning_scope = str(pruning_cfg.get('scope', 'whole_model')).strip().lower()
         self.pruning_method = str(pruning_cfg.get('method', 'structural')).strip().lower()
+        self.pruning_interval_tasks = max(1, int(pruning_cfg.get('interval_tasks', 1)))
+        self.pruning_importance = str(pruning_cfg.get('importance', 'magnitude')).strip().lower()
+        self.pruning_use_replay_for_taylor = bool(pruning_cfg.get('use_replay_for_taylor', True))
+        self.pruning_taylor_replay_batches = max(0, int(pruning_cfg.get('taylor_replay_batches', 2)))
+        self.pruning_taylor_train_batches = max(0, int(pruning_cfg.get('taylor_train_batches', 1)))
+        self.pruning_taylor_replay_batch_size = max(
+            1,
+            int(
+                pruning_cfg.get(
+                    'taylor_replay_batch_size',
+                    config.get('replay_buffer', {}).get('replay_batch_size', 32)
+                )
+            )
+        )
         self.pruning_warmup_tasks = max(0, int(pruning_cfg.get('warmup_tasks', 2)))
         self.pruning_budget_driven = bool(pruning_cfg.get('budget_driven', True))
         self.pruning_min_amount = float(pruning_cfg.get('min_amount', 0.0))
@@ -123,6 +138,14 @@ class ContinualLearner:
         self.protect_classifier = bool(pruning_cfg.get('protect_classifier', True))
         self.protect_downsample = bool(pruning_cfg.get('protect_downsample', True))
 
+        rollback_cfg = pruning_cfg.get('rollback', {})
+        self.prune_rollback_enabled = bool(rollback_cfg.get('enabled', False))
+        self.prune_rollback_max_mca_drop = float(rollback_cfg.get('max_mca_drop', 0.01))
+        self.prune_rollback_eval_max_batches = max(
+            1,
+            int(rollback_cfg.get('eval_max_batches', 20))
+        )
+
         recovery_cfg = pruning_cfg.get('recovery', {})
         self.prune_recovery_enabled = bool(recovery_cfg.get('enabled', True))
         self.prune_recovery_epochs = max(0, int(recovery_cfg.get('epochs', 4)))
@@ -133,6 +156,13 @@ class ContinualLearner:
         self.pruning_max_amount = min(max(self.pruning_max_amount, 0.0), 1.0)
         if self.pruning_max_amount < self.pruning_min_amount:
             self.pruning_max_amount = self.pruning_min_amount
+        if self.pruning_importance not in {'magnitude', 'taylor'}:
+            print(
+                f"[WARNING] Unsupported network_pruning.importance='{self.pruning_importance}'. "
+                "Falling back to 'magnitude'."
+            )
+            self.pruning_importance = 'magnitude'
+        self.prune_rollback_max_mca_drop = max(0.0, self.prune_rollback_max_mca_drop)
         self.prune_recovery_lr_scale = max(self.prune_recovery_lr_scale, 0.0)
         if len(self.pruning_example_input_shape) != 4:
             self.pruning_example_input_shape = (1, 3, 224, 224)
@@ -148,6 +178,20 @@ class ContinualLearner:
         self.expansion_history = []
         self.pruning_history = []
         self.current_task_new_adapter_ids = set()
+        self.last_taylor_gradient_stats = {
+            'replay_batches': 0,
+            'train_batches': 0,
+            'total_batches': 0
+        }
+
+    def _is_pruning_task(self, task_id: int) -> bool:
+        """Return whether pruning should run for this task id under warmup/interval rules."""
+        if not self.pruning_enabled:
+            return False
+        if task_id < self.pruning_warmup_tasks:
+            return False
+        offset = task_id - self.pruning_warmup_tasks
+        return (offset % self.pruning_interval_tasks) == 0
 
     def _resolve_expansion_layers(self, strategy: str) -> List[str]:
         """Resolve configured strategy into an expansion layer schedule."""
@@ -460,6 +504,306 @@ class ContinualLearner:
 
         return ignored_layers
 
+    def _compute_mca_from_loader(
+        self,
+        dataloader: Optional[DataLoader],
+        max_batches: Optional[int] = None
+    ) -> Optional[float]:
+        """Compute MCA on a dataloader without mutating AMCA history state."""
+        if dataloader is None:
+            return None
+
+        if max_batches is None:
+            max_batches = self.prune_rollback_eval_max_batches
+        max_batches = max(1, int(max_batches))
+
+        num_classes = int(self.config.get('benchmark', {}).get('total_classes', 7))
+        max_cls = max(1, num_classes)
+        class_correct = torch.zeros(max_cls, device=self.device, dtype=torch.long)
+        class_total = torch.zeros(max_cls, device=self.device, dtype=torch.long)
+
+        self.model.eval()
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataloader):
+                if batch_idx >= max_batches:
+                    break
+
+                if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+                    continue
+
+                images, labels = batch[0], batch[1]
+                if self.device == 'cuda':
+                    images = images.to(
+                        self.device,
+                        dtype=torch.float32,
+                        non_blocking=True,
+                        memory_format=torch.channels_last
+                    )
+                else:
+                    images = images.to(self.device, dtype=torch.float32, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+
+                outputs = self.model(images)
+                predicted = outputs.argmax(dim=1)
+
+                class_total += torch.bincount(labels, minlength=max_cls)[:max_cls]
+                correct_mask = (predicted == labels)
+                class_correct += torch.bincount(labels[correct_mask], minlength=max_cls)[:max_cls]
+
+        valid = class_total > 0
+        if valid.any():
+            mca = (class_correct.float()[valid] / class_total.float()[valid]).mean().item()
+            return float(mca)
+        return 0.0
+
+    def _snapshot_model_for_rollback(self) -> Optional[nn.Module]:
+        """Create a CPU snapshot for prune rollback checks."""
+        if not self.prune_rollback_enabled:
+            return None
+        try:
+            return copy.deepcopy(self.model).cpu()
+        except Exception as e:
+            print(f"[WARNING] Could not snapshot model for rollback: {e}")
+            return None
+
+    def _restore_model_from_snapshot(self, snapshot_model: Optional[nn.Module], task_id: int) -> bool:
+        """Restore model from rollback snapshot and refresh training state."""
+        if snapshot_model is None:
+            return False
+
+        try:
+            restored_model = snapshot_model.to(self.device)
+
+            self.model = restored_model
+            self.train_model = self.model
+
+            self._refresh_training_state_after_prune(
+                task_id=task_id,
+                learning_rate=self.learning_rate,
+                scheduler_tmax=self.epochs_per_task
+            )
+            return True
+        except Exception as e:
+            print(f"[WARNING] Could not restore rollback snapshot: {e}")
+            return False
+
+    def _prepare_taylor_gradients_for_pruning(
+        self,
+        train_loader: Optional[DataLoader] = None
+    ) -> bool:
+        """Accumulate first-order gradients used by Taylor importance."""
+        self.model.zero_grad(set_to_none=True)
+        self.model.eval()
+
+        replay_batches_used = 0
+        train_batches_used = 0
+
+        if (
+            self.pruning_use_replay_for_taylor
+            and self.pruning_taylor_replay_batches > 0
+            and len(self.replay_buffer) > 0
+        ):
+            replay_batch_size = min(self.pruning_taylor_replay_batch_size, len(self.replay_buffer))
+            for _ in range(self.pruning_taylor_replay_batches):
+                replay_batch = self.replay_buffer.get_batch(batch_size=replay_batch_size)
+                if replay_batch is None:
+                    break
+
+                if self.device == 'cuda':
+                    replay_images = replay_batch['images'].to(
+                        self.device,
+                        dtype=torch.float32,
+                        non_blocking=True,
+                        memory_format=torch.channels_last
+                    )
+                else:
+                    replay_images = replay_batch['images'].to(
+                        self.device,
+                        dtype=torch.float32,
+                        non_blocking=True
+                    )
+
+                replay_labels = replay_batch['labels'].to(self.device, non_blocking=True)
+                replay_logits = self.model(replay_images)
+                replay_loss = F.cross_entropy(replay_logits.float(), replay_labels)
+
+                if replay_batch.get('soft_targets', None) is not None:
+                    soft_targets = replay_batch['soft_targets'].to(self.device, non_blocking=True).float()
+                    if soft_targets.ndim == 2 and soft_targets.size(1) == replay_logits.size(1):
+                        replay_log_probs = F.log_softmax(
+                            replay_logits.float() / self.replay_buffer.distillation_temp,
+                            dim=1
+                        )
+                        replay_loss += 0.5 * F.kl_div(
+                            replay_log_probs,
+                            soft_targets,
+                            reduction='batchmean'
+                        )
+
+                replay_loss.backward()
+                replay_batches_used += 1
+
+        if train_loader is not None and self.pruning_taylor_train_batches > 0:
+            for batch_idx, (images, labels) in enumerate(train_loader):
+                if train_batches_used >= self.pruning_taylor_train_batches:
+                    break
+
+                if self.device == 'cuda':
+                    images = images.to(
+                        self.device,
+                        dtype=torch.float32,
+                        non_blocking=True,
+                        memory_format=torch.channels_last
+                    )
+                else:
+                    images = images.to(self.device, dtype=torch.float32, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+
+                logits = self.model(images)
+                loss = F.cross_entropy(logits.float(), labels)
+                loss.backward()
+                train_batches_used += 1
+
+                if train_batches_used >= self.pruning_taylor_train_batches:
+                    break
+
+        total_batches = replay_batches_used + train_batches_used
+        self.last_taylor_gradient_stats = {
+            'replay_batches': int(replay_batches_used),
+            'train_batches': int(train_batches_used),
+            'total_batches': int(total_batches)
+        }
+
+        if total_batches <= 0:
+            self.model.zero_grad(set_to_none=True)
+            return False
+
+        scale = 1.0 / float(total_batches)
+        for parameter in self.model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(scale)
+
+        print(
+            "Prepared Taylor gradients for structural pruning: "
+            f"replay_batches={replay_batches_used}, "
+            f"train_batches={train_batches_used}"
+        )
+        return True
+
+    def _resolve_structural_importance(
+        self,
+        train_loader: Optional[DataLoader] = None
+    ):
+        """Resolve structural pruning importance criterion from config."""
+        if tp is None:
+            raise RuntimeError("torch-pruning is required for structural importance resolution")
+
+        if self.pruning_importance != 'taylor':
+            self.last_taylor_gradient_stats = {
+                'replay_batches': 0,
+                'train_batches': 0,
+                'total_batches': 0
+            }
+            return tp.importance.MagnitudeImportance(p=1), 'magnitude'
+
+        taylor_ready = self._prepare_taylor_gradients_for_pruning(train_loader=train_loader)
+        if not taylor_ready:
+            print(
+                "[WARNING] Taylor importance requested but no gradients were prepared. "
+                "Falling back to magnitude importance."
+            )
+            return tp.importance.MagnitudeImportance(p=1), 'magnitude'
+
+        taylor_cls = getattr(tp.importance, 'GroupTaylorImportance', None)
+        if taylor_cls is None:
+            taylor_cls = getattr(tp.importance, 'TaylorImportance', None)
+
+        if taylor_cls is None:
+            print(
+                "[WARNING] torch-pruning Taylor importance class not found. "
+                "Falling back to magnitude importance."
+            )
+            return tp.importance.MagnitudeImportance(p=1), 'magnitude'
+
+        try:
+            return taylor_cls(), 'taylor'
+        except Exception as e:
+            print(
+                "[WARNING] Could not initialize Taylor importance "
+                f"({e}); falling back to magnitude importance."
+            )
+            return tp.importance.MagnitudeImportance(p=1), 'magnitude'
+
+    def _maybe_rollback_post_prune(
+        self,
+        task_id: int,
+        prune_applied: bool,
+        eval_loader: Optional[DataLoader],
+        pre_prune_mca: Optional[float],
+        snapshot_model: Optional[nn.Module]
+    ) -> bool:
+        """Rollback pruning if post-prune MCA drop exceeds configured threshold."""
+        if not prune_applied:
+            return False
+        if not self.prune_rollback_enabled:
+            return False
+        if eval_loader is None:
+            print(f"Skipping prune rollback check at task {task_id}: no evaluation loader")
+            return False
+        if pre_prune_mca is None:
+            print(f"Skipping prune rollback check at task {task_id}: pre-prune MCA unavailable")
+            return False
+
+        try:
+            post_prune_mca = self._compute_mca_from_loader(
+                eval_loader,
+                max_batches=self.prune_rollback_eval_max_batches
+            )
+        except Exception as e:
+            print(f"[WARNING] Could not compute post-prune MCA for rollback check: {e}")
+            return False
+
+        if post_prune_mca is None:
+            return False
+
+        mca_drop = float(pre_prune_mca - post_prune_mca)
+        rollback_needed = mca_drop > self.prune_rollback_max_mca_drop
+
+        if self.pruning_history and self.pruning_history[-1].get('task_id') == int(task_id):
+            self.pruning_history[-1]['rollback_pre_mca'] = float(pre_prune_mca)
+            self.pruning_history[-1]['rollback_post_mca'] = float(post_prune_mca)
+            self.pruning_history[-1]['rollback_mca_drop'] = float(mca_drop)
+            self.pruning_history[-1]['rollback_threshold'] = float(self.prune_rollback_max_mca_drop)
+
+        if not rollback_needed:
+            print(
+                f"Prune rollback check passed at task {task_id}: "
+                f"MCA drop={mca_drop:.4f} <= threshold={self.prune_rollback_max_mca_drop:.4f}"
+            )
+            if self.pruning_history and self.pruning_history[-1].get('task_id') == int(task_id):
+                self.pruning_history[-1]['rolled_back'] = False
+            return False
+
+        restored = self._restore_model_from_snapshot(snapshot_model=snapshot_model, task_id=task_id)
+        if not restored:
+            print(
+                f"[WARNING] Prune rollback triggered at task {task_id} but restore failed; "
+                "keeping pruned model."
+            )
+            if self.pruning_history and self.pruning_history[-1].get('task_id') == int(task_id):
+                self.pruning_history[-1]['rolled_back'] = False
+                self.pruning_history[-1]['rollback_restore_failed'] = True
+            return False
+
+        print(
+            f"Rolled back pruning at task {task_id}: "
+            f"MCA drop={mca_drop:.4f} > threshold={self.prune_rollback_max_mca_drop:.4f}"
+        )
+        if self.pruning_history and self.pruning_history[-1].get('task_id') == int(task_id):
+            self.pruning_history[-1]['rolled_back'] = True
+
+        return True
+
     def _refresh_training_state_after_prune(
         self,
         task_id: int,
@@ -674,8 +1018,30 @@ class ContinualLearner:
 
         # Automatically distill replay memory at each chronological task boundary.
         self._auto_distill_replay_buffer_end_of_task(task_id)
+
+        pre_prune_mca = None
+        rollback_snapshot = None
+        if self.prune_rollback_enabled and self._is_pruning_task(task_id):
+            pre_prune_mca = self._compute_mca_from_loader(
+                cached_test_loader,
+                max_batches=self.prune_rollback_eval_max_batches
+            )
+            rollback_snapshot = self._snapshot_model_for_rollback()
+            if pre_prune_mca is not None:
+                print(f"Pre-prune MCA estimate (task {task_id}): {pre_prune_mca:.4f}")
+
         prune_applied = self._auto_prune_network_end_of_task(task_id, train_loader=train_loader)
         self._post_prune_recovery(task_id, train_loader, prune_applied)
+
+        rolled_back = self._maybe_rollback_post_prune(
+            task_id=task_id,
+            prune_applied=prune_applied,
+            eval_loader=cached_test_loader,
+            pre_prune_mca=pre_prune_mca,
+            snapshot_model=rollback_snapshot
+        )
+        if rolled_back:
+            prune_applied = False
         
         # Final Full Evaluation
         print(f"\nFinal evaluation after task {task_id}:")
@@ -1142,7 +1508,9 @@ class ContinualLearner:
             with torch.no_grad():
                 _ = self.model(example_inputs)
 
-            importance = tp.importance.MagnitudeImportance(p=1)
+            importance, importance_name = self._resolve_structural_importance(
+                train_loader=train_loader
+            )
             pruner = tp.pruner.MagnitudePruner(
                 self.model,
                 example_inputs=example_inputs,
@@ -1165,6 +1533,7 @@ class ContinualLearner:
                 'scope': self.pruning_scope,
                 'method': 'structural',
                 'amount': float(prune_amount),
+                'importance': importance_name,
                 'effective_params_before': int(before_effective),
                 'effective_params_after': int(after_effective),
                 'pruned_params': int(pruned_now),
@@ -1172,12 +1541,17 @@ class ContinualLearner:
                 'total_params_after': int(after_total),
                 'total_removed_params': int(total_removed),
                 'ignored_layers': int(len(ignored_layers)),
-                'example_input_shape': list(example_inputs.shape)
+                'example_input_shape': list(example_inputs.shape),
+                'taylor_replay_batches': int(self.last_taylor_gradient_stats.get('replay_batches', 0)),
+                'taylor_train_batches': int(self.last_taylor_gradient_stats.get('train_batches', 0))
             })
+
+            self.model.zero_grad(set_to_none=True)
 
             print(
                 f"Auto-structural-pruned whole model at end of task {task_id}: "
                 f"amount={prune_amount:.4f}, ignored_layers={len(ignored_layers)}, "
+                f"importance={importance_name}, "
                 f"effective params {before_effective:,} -> {after_effective:,}, "
                 f"total params {before_total:,} -> {after_total:,} "
                 f"(freed {pruned_now:,} effective / {total_removed:,} physical)"
@@ -1200,6 +1574,13 @@ class ContinualLearner:
             print(
                 f"Skipping pruning at task {task_id}: warmup active "
                 f"(warmup_tasks={self.pruning_warmup_tasks})"
+            )
+            return False
+
+        if not self._is_pruning_task(task_id):
+            print(
+                f"Skipping pruning at task {task_id}: interval active "
+                f"(interval_tasks={self.pruning_interval_tasks})"
             )
             return False
 

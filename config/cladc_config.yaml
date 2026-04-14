@@ -51,17 +51,27 @@ network_pruning:
   enabled: true
   amount: 0.01  # Maximum fraction pruned at task end (applied by scope)
   warmup_tasks: 2  # Do not prune during first N tasks to protect early AMCA
+  interval_tasks: 1  # Run pruning every N tasks after warmup
   budget_driven: true  # Prune only as needed to reopen next-task expansion budget
   min_amount: 0.0
   max_amount: 0.01
   scope: "whole_model"  # Options: "whole_model", "older_adapters_only", or "all_adapters"
   method: "structural"  # Options: "structural" (torch-pruning) or "unstructured"
+  importance: "taylor"  # Options: "magnitude" or "taylor"
+  use_replay_for_taylor: true
+  taylor_replay_batches: 3
+  taylor_train_batches: 0  # Keep Taylor scoring replay-driven by default
+  taylor_replay_batch_size: 32
   rebuild_optimizer_after_prune: true
   recompile_after_prune: true
   example_input_shape: [1, 3, 224, 224]
   protect_current_task_adapters: true
   protect_classifier: true
   protect_downsample: true
+  rollback:
+    enabled: true
+    max_mca_drop: 0.01
+    eval_max_batches: 20
   recovery:
     enabled: true
     epochs: 5
