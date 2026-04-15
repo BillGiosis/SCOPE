@@ -54,6 +54,49 @@ class ReplayBuffer:
         self.initialized = True
         print(f"Buffer Storage Initialized: {self.max_size} slots")
 
+    def _select_class_aware_overflow_indices(self, overflow_count: int) -> torch.Tensor:
+        """Select replacement indices by evicting overrepresented classes first."""
+        if overflow_count <= 0:
+            return torch.empty((0,), dtype=torch.long, device=self.storage_device)
+
+        if self.num_samples <= 0:
+            return torch.empty((0,), dtype=torch.long, device=self.storage_device)
+
+        labels_cpu = self.labels[:self.num_samples].detach().cpu()
+        unique_labels = torch.unique(labels_cpu)
+
+        class_to_indices = {}
+        class_counts = {}
+        for class_tensor in unique_labels:
+            class_id = int(class_tensor.item())
+            class_indices = torch.nonzero(labels_cpu == class_id, as_tuple=True)[0]
+            if class_indices.numel() == 0:
+                continue
+            shuffled = class_indices[torch.randperm(class_indices.numel())].tolist()
+            class_to_indices[class_id] = shuffled
+            class_counts[class_id] = len(shuffled)
+
+        selected = []
+        min_per_class = 1
+
+        for _ in range(overflow_count):
+            eligible_classes = [
+                class_id
+                for class_id, count in class_counts.items()
+                if count > min_per_class and class_to_indices.get(class_id)
+            ]
+
+            if eligible_classes:
+                evict_class = max(eligible_classes, key=lambda class_id: class_counts[class_id])
+                evict_index = int(class_to_indices[evict_class].pop())
+                class_counts[evict_class] -= 1
+            else:
+                evict_index = int(torch.randint(0, self.num_samples, (1,)).item())
+
+            selected.append(evict_index)
+
+        return torch.tensor(selected, dtype=torch.long, device=self.storage_device)
+
     def add_samples(self, images: torch.Tensor, labels: torch.Tensor, task_id: int, soft_targets: Optional[torch.Tensor] = None):
         """Vectorized Add without Dictionary Overhead."""
         batch_size = images.size(0)
@@ -76,24 +119,37 @@ class ReplayBuffer:
         if self.soft_targets is not None and soft_targets is not None:
             cpu_soft = soft_targets.detach().to(device=self.storage_device, dtype=target_img_dtype, non_blocking=True)
 
-        # Vectorized Index Logic
-        indices = torch.arange(self.num_samples, min(self.num_samples + batch_size, self.current_max_size), device=self.storage_device)
-        
-        # Handle Overflow
-        if self.num_samples + batch_size > self.current_max_size:
-            remaining = (self.num_samples + batch_size) - self.current_max_size
-            overflow_indices = torch.randint(0, self.num_samples, (remaining,), device=self.storage_device)
-            indices = torch.cat([indices, overflow_indices])
-            self.num_samples = self.current_max_size
-        else:
-            self.num_samples += batch_size
+        # Fill available free slots first.
+        free_slots = max(0, self.current_max_size - self.num_samples)
+        fill_count = min(batch_size, free_slots)
 
-        # Vectorized Write
-        self.images[indices] = cpu_images
-        self.labels[indices] = cpu_labels
-        self.task_ids[indices] = task_id
-        if cpu_soft is not None:
-            self.soft_targets[indices] = cpu_soft
+        if fill_count > 0:
+            fill_start = self.num_samples
+            fill_end = self.num_samples + fill_count
+            fill_indices = torch.arange(fill_start, fill_end, device=self.storage_device)
+
+            self.images[fill_indices] = cpu_images[:fill_count]
+            self.labels[fill_indices] = cpu_labels[:fill_count]
+            self.task_ids[fill_indices] = task_id
+            if cpu_soft is not None:
+                self.soft_targets[fill_indices] = cpu_soft[:fill_count]
+
+            self.num_samples = fill_end
+
+        # Overflow samples replace existing entries using class-aware eviction.
+        overflow_count = batch_size - fill_count
+        if overflow_count > 0:
+            overflow_indices = self._select_class_aware_overflow_indices(overflow_count)
+            overflow_images = cpu_images[fill_count:fill_count + overflow_count]
+            overflow_labels = cpu_labels[fill_count:fill_count + overflow_count]
+
+            self.images[overflow_indices] = overflow_images
+            self.labels[overflow_indices] = overflow_labels
+            self.task_ids[overflow_indices] = task_id
+            if cpu_soft is not None:
+                self.soft_targets[overflow_indices] = cpu_soft[fill_count:fill_count + overflow_count]
+
+        self.num_samples = min(self.num_samples, self.current_max_size)
 
     def get_batch(self, batch_size: int, task_id: Optional[int] = None, device='cuda') -> Dict:
         """Fully Vectorized Retrieval with Cached Weights."""

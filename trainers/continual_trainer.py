@@ -132,6 +132,25 @@ class ContinualLearner:
             pruning_cfg.get('recompile_after_prune', True)
         )
 
+        if (
+            self.use_torch_compile
+            and self.pruning_enabled
+            and self.pruning_scope == 'whole_model'
+            and self.pruning_method == 'structural'
+        ):
+            try:
+                import torch._dynamo as dynamo
+                dynamo.config.force_parameter_static_shapes = False
+                print(
+                    "Enabled dynamic parameter shapes for torch.compile "
+                    "(structural pruning is active)."
+                )
+            except Exception as e:
+                print(
+                    "[WARNING] Could not enable dynamic parameter shapes for torch.compile: "
+                    f"{e}"
+                )
+
         self.protect_current_task_adapters = bool(
             pruning_cfg.get('protect_current_task_adapters', True)
         )
@@ -821,6 +840,11 @@ class ContinualLearner:
         self.train_model = self.model
         if self.recompile_after_prune and self.use_torch_compile:
             try:
+                try:
+                    import torch._dynamo as dynamo
+                    dynamo.reset()
+                except Exception:
+                    pass
                 self.train_model = torch.compile(self.model)
                 print(f"Recompiled training model after pruning for task {task_id}")
             except Exception as e:
@@ -1084,7 +1108,9 @@ class ContinualLearner:
         
         collected_count = 0
         samples_per_class_limit = self.config['replay_buffer'].get('samples_per_class', 200)
-        collection_limit = samples_per_class_limit * 7 
+        num_classes = int(self.config['benchmark'].get('total_classes', 7))
+        collection_limit = samples_per_class_limit * num_classes
+        class_capture_counts = {class_id: 0 for class_id in range(num_classes)}
 
         for batch_idx, (images, labels) in pbar:
             try:
@@ -1101,19 +1127,51 @@ class ContinualLearner:
                 labels = labels.to(self.device, non_blocking=True)
                 
                 # Logic to capture logits for replay reuse
-                capture_outputs = False
+                capture_indices = None
                 if collection_dict is not None and collected_count < collection_limit:
-                    if batch_idx < 20: 
-                        capture_outputs = True
+                    selected_indices = []
+                    labels_cpu = labels.detach().cpu()
+                    unique_batch_labels = labels_cpu.unique(sorted=False)
+
+                    for class_tensor in unique_batch_labels:
+                        class_id = int(class_tensor.item())
+                        if class_id < 0:
+                            continue
+                        if class_id not in class_capture_counts:
+                            continue
+
+                        remaining_for_class = samples_per_class_limit - class_capture_counts[class_id]
+                        if remaining_for_class <= 0:
+                            continue
+
+                        class_positions = torch.nonzero(labels_cpu == class_id, as_tuple=True)[0]
+                        if class_positions.numel() == 0:
+                            continue
+
+                        take_count = min(int(class_positions.numel()), int(remaining_for_class))
+                        selected_indices.append(class_positions[:take_count])
+
+                    if selected_indices:
+                        capture_indices = torch.cat(selected_indices, dim=0)
 
                 with torch.amp.autocast('cuda', enabled=self.use_amp):
                     outputs = self.train_model(images)
                 
-                if capture_outputs:
-                    collection_dict['images'].append(images.detach().cpu())
-                    collection_dict['labels'].append(labels.detach().cpu())
-                    collection_dict['logits'].append(outputs.detach().cpu())
-                    collected_count += images.size(0)
+                if capture_indices is not None and capture_indices.numel() > 0:
+                    selected_images = images.index_select(0, capture_indices.to(images.device)).detach().cpu()
+                    selected_labels = labels.index_select(0, capture_indices.to(labels.device)).detach().cpu()
+                    selected_logits = outputs.index_select(0, capture_indices.to(outputs.device)).detach().cpu()
+
+                    collection_dict['images'].append(selected_images)
+                    collection_dict['labels'].append(selected_labels)
+                    collection_dict['logits'].append(selected_logits)
+
+                    for selected_label in selected_labels.tolist():
+                        label_int = int(selected_label)
+                        if label_int in class_capture_counts:
+                            class_capture_counts[label_int] += 1
+
+                    collected_count += int(selected_labels.numel())
 
                 outputs_float = outputs.float()
                 
@@ -1148,8 +1206,11 @@ class ContinualLearner:
                         
                         with torch.amp.autocast('cuda', enabled=self.use_amp):
                             r_out = self.train_model(r_imgs)
-                            
-                        loss += 0.5 * F.cross_entropy(r_out.float(), r_lbls)
+
+                        if self.criterion is not None:
+                            loss += 0.5 * self.criterion(r_out.float(), r_lbls)
+                        else:
+                            loss += 0.5 * F.cross_entropy(r_out.float(), r_lbls)
                         
                         if replay_batch['soft_targets'] is not None:
                             soft_targets = replay_batch['soft_targets'].to(self.device, non_blocking=True).float()
