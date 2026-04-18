@@ -135,7 +135,7 @@ class ContinualLearner:
         if (
             self.use_torch_compile
             and self.pruning_enabled
-            and self.pruning_scope == 'whole_model'
+            and self.pruning_scope in {'whole_model', 'hybrid'}
             and self.pruning_method == 'structural'
         ):
             try:
@@ -202,6 +202,8 @@ class ContinualLearner:
             'train_batches': 0,
             'total_batches': 0
         }
+        self.last_good_model_snapshot: Optional[nn.Module] = None
+        self.last_good_task_id: Optional[int] = None
 
     def _is_pruning_task(self, task_id: int) -> bool:
         """Return whether pruning should run for this task id under warmup/interval rules."""
@@ -496,6 +498,12 @@ class ContinualLearner:
         ignored_layers = []
         ignored_ids = set()
 
+        if self.protect_classifier:
+            classifier_module = getattr(self.model, 'fc', None)
+            if classifier_module is not None and id(classifier_module) not in ignored_ids:
+                ignored_layers.append(classifier_module)
+                ignored_ids.add(id(classifier_module))
+
         for module_name, module in self.model.named_modules():
             should_ignore = False
 
@@ -606,11 +614,51 @@ class ContinualLearner:
             print(f"[WARNING] Could not restore rollback snapshot: {e}")
             return False
 
+    def _model_has_nonfinite_parameters(self) -> bool:
+        """Return True if any model parameter contains NaN or Inf."""
+        for parameter in self.model.parameters():
+            if not torch.isfinite(parameter).all():
+                return True
+        return False
+
+    def _snapshot_last_good_model(self, task_id: int) -> bool:
+        """Persist a CPU snapshot of a healthy model at task boundary."""
+        try:
+            self.last_good_model_snapshot = copy.deepcopy(self.model).cpu()
+            self.last_good_task_id = int(task_id)
+            return True
+        except Exception as e:
+            print(f"[WARNING] Could not snapshot last-good model at task {task_id}: {e}")
+            return False
+
+    def _restore_last_good_model(self, task_id: int) -> bool:
+        """Restore model from the most recent healthy task snapshot."""
+        if self.last_good_model_snapshot is None:
+            return False
+
+        try:
+            restored = copy.deepcopy(self.last_good_model_snapshot).to(self.device)
+            if self.device == 'cuda':
+                restored = restored.to(memory_format=torch.channels_last)
+            self.model = restored
+            self.train_model = self.model
+            print(
+                f"Restored last-good model snapshot from task {self.last_good_task_id} "
+                f"before starting task {task_id}"
+            )
+            return True
+        except Exception as e:
+            print(f"[WARNING] Could not restore last-good model snapshot: {e}")
+            return False
+
     def _prepare_taylor_gradients_for_pruning(
         self,
         train_loader: Optional[DataLoader] = None
     ) -> bool:
         """Accumulate first-order gradients used by Taylor importance."""
+        expected_num_classes = int(self.config.get('benchmark', {}).get('total_classes', 7))
+        self._ensure_classifier_head(expected_num_classes)
+
         self.model.zero_grad(set_to_none=True)
         self.model.eval()
 
@@ -644,16 +692,35 @@ class ContinualLearner:
 
                 replay_labels = replay_batch['labels'].to(self.device, non_blocking=True)
                 replay_logits = self.model(replay_images)
+
+                num_output_classes = int(replay_logits.size(1))
+                valid_label_mask = (replay_labels >= 0) & (replay_labels < num_output_classes)
+                if not bool(valid_label_mask.all().item()):
+                    invalid_count = int((~valid_label_mask).sum().item())
+                    valid_count = int(valid_label_mask.sum().item())
+                    print(
+                        "[WARNING] Taylor replay batch contains out-of-range labels; "
+                        f"dropping {invalid_count} samples (n_classes={num_output_classes})."
+                    )
+                    if valid_count <= 0:
+                        continue
+                    replay_images = replay_images[valid_label_mask]
+                    replay_labels = replay_labels[valid_label_mask]
+                    replay_logits = replay_logits[valid_label_mask]
+
                 replay_loss = F.cross_entropy(replay_logits.float(), replay_labels)
 
                 if replay_batch.get('soft_targets', None) is not None:
                     soft_targets = replay_batch['soft_targets'].to(self.device, non_blocking=True).float()
+                    if soft_targets.size(0) == valid_label_mask.size(0):
+                        soft_targets = soft_targets[valid_label_mask]
                     if soft_targets.ndim == 2 and soft_targets.size(1) == replay_logits.size(1):
+                        temp = max(float(self.replay_buffer.distillation_temp), 1e-6)
                         replay_log_probs = F.log_softmax(
-                            replay_logits.float() / self.replay_buffer.distillation_temp,
+                            replay_logits.float() / temp,
                             dim=1
                         )
-                        replay_loss += 0.5 * F.kl_div(
+                        replay_loss += 0.5 * (temp ** 2) * F.kl_div(
                             replay_log_probs,
                             soft_targets,
                             reduction='batchmean'
@@ -679,6 +746,21 @@ class ContinualLearner:
                 labels = labels.to(self.device, non_blocking=True)
 
                 logits = self.model(images)
+
+                num_output_classes = int(logits.size(1))
+                valid_label_mask = (labels >= 0) & (labels < num_output_classes)
+                if not bool(valid_label_mask.all().item()):
+                    invalid_count = int((~valid_label_mask).sum().item())
+                    valid_count = int(valid_label_mask.sum().item())
+                    print(
+                        "[WARNING] Taylor train batch contains out-of-range labels; "
+                        f"dropping {invalid_count} samples (n_classes={num_output_classes})."
+                    )
+                    if valid_count <= 0:
+                        continue
+                    logits = logits[valid_label_mask]
+                    labels = labels[valid_label_mask]
+
                 loss = F.cross_entropy(logits.float(), labels)
                 loss.backward()
                 train_batches_used += 1
@@ -701,6 +783,10 @@ class ContinualLearner:
         for parameter in self.model.parameters():
             if parameter.grad is not None:
                 parameter.grad.mul_(scale)
+            else:
+                # Ensure every parameter has a gradient tensor so Taylor-based
+                # importance never receives None gradients from torch-pruning.
+                parameter.grad = torch.zeros_like(parameter)
 
         print(
             "Prepared Taylor gradients for structural pruning: "
@@ -830,6 +916,9 @@ class ContinualLearner:
         scheduler_tmax: Optional[int] = None
     ):
         """Refresh optimizer and compiled training graph after structural pruning."""
+        expected_num_classes = int(self.config.get('benchmark', {}).get('total_classes', 7))
+        self._ensure_classifier_head(expected_num_classes)
+
         if self.rebuild_optimizer_after_prune:
             self._create_optimizer(
                 learning_rate=learning_rate,
@@ -933,6 +1022,48 @@ class ContinualLearner:
             eta_min=lr * 0.01
         )
 
+    def _ensure_classifier_head(self, expected_num_classes: int):
+        """Ensure classifier head exists and matches expected class count."""
+        expected_num_classes = max(1, int(expected_num_classes))
+        current_fc = getattr(self.model, 'fc', None)
+
+        if current_fc is None:
+            self.model.add_task_head(expected_num_classes)
+            print(f"Created shared classifier with {expected_num_classes} classes")
+            return
+
+        current_out = int(getattr(current_fc, 'out_features', expected_num_classes))
+        if current_out == expected_num_classes:
+            return
+
+        device = next(self.model.parameters()).device
+        current_in = int(getattr(current_fc, 'in_features', getattr(self.model, 'feature_dim', 2048)))
+        new_fc = nn.Linear(current_in, expected_num_classes).to(device)
+
+        try:
+            with torch.no_grad():
+                copy_out = min(current_out, expected_num_classes)
+                copy_in = min(
+                    int(getattr(current_fc, 'in_features', new_fc.in_features)),
+                    int(new_fc.in_features)
+                )
+                if hasattr(current_fc, 'weight') and current_fc.weight is not None:
+                    new_fc.weight[:copy_out, :copy_in].copy_(current_fc.weight[:copy_out, :copy_in])
+                if (
+                    hasattr(current_fc, 'bias')
+                    and current_fc.bias is not None
+                    and new_fc.bias is not None
+                ):
+                    new_fc.bias[:copy_out].copy_(current_fc.bias[:copy_out])
+        except Exception as e:
+            print(f"[WARNING] Could not transfer classifier weights while resizing head: {e}")
+
+        self.model.fc = new_fc
+        print(
+            f"[WARNING] Resized classifier head from {current_out} to "
+            f"{expected_num_classes} outputs to match config/classes."
+        )
+
     def train_task(self, task_id: int, train_loader: DataLoader, test_loaders: List[DataLoader]):
         """Train on a single task."""
         print(f"\n{'='*60}")
@@ -940,39 +1071,78 @@ class ContinualLearner:
         print(f"{'='*60}\n")
         
         if not check_model_health(self.model, f"Task {task_id} start"):
-            print(f"[CRITICAL] Model corrupted before Task {task_id}! Training may fail.")
+            restored = self._restore_last_good_model(task_id)
+            if not restored:
+                raise RuntimeError(
+                    f"Model corrupted before Task {task_id}, and no healthy snapshot is available. "
+                    "Stopping to avoid poisoning replay and metrics."
+                )
+            if not check_model_health(self.model, f"Task {task_id} restored-start"):
+                raise RuntimeError(
+                    f"Model remains corrupted after restore attempt before Task {task_id}."
+                )
         
         task_start_time = time.time()
-        
-        if self.model.fc is None:
-            num_classes = self._get_num_classes(train_loader)
-            self.model.add_task_head(num_classes)
-            print(f"Created shared classifier with {num_classes} classes")
+
+        expected_num_classes = int(self.config.get('benchmark', {}).get('total_classes', 7))
+        self._ensure_classifier_head(expected_num_classes)
 
         # Deterministic expansion is applied exactly once per task, before optimizer creation.
         self._expand_network_at_task_start(task_id)
+
+        frozen_historical_adapters = 0
+        trainable_new_adapters = 0
+        for _, _, adapter in self._iter_adapters():
+            is_new_adapter = id(adapter) in self.current_task_new_adapter_ids
+            for param in adapter.parameters():
+                param.requires_grad = bool(is_new_adapter)
+            if is_new_adapter:
+                trainable_new_adapters += 1
+            else:
+                frozen_historical_adapters += 1
+
+        print(
+            "Adapter freeze policy applied: "
+            f"trainable_new={trainable_new_adapters}, "
+            f"frozen_historical={frozen_historical_adapters}"
+        )
+
         self._prepare_training_model_for_task(task_id)
         
         self._create_optimizer()
         
         # --- Class Balanced Loss Setup ---
         print("Calculating class counts for Class Balanced Loss")
+        num_classes = int(
+            getattr(self.model.fc, 'out_features', self.config['benchmark'].get('total_classes', 7))
+        )
+        max_label_observed = -1
+
         if hasattr(train_loader.dataset, 'targets'):
             all_labels = train_loader.dataset.targets
             if isinstance(all_labels, list) and len(all_labels) > 0 and torch.is_tensor(all_labels[0]):
                 all_labels = [l.item() for l in all_labels]
-            
-            num_classes = self.config['benchmark'].get('total_classes', 7)
+
+            all_labels = [int(v) for v in all_labels]
+            if all_labels:
+                max_label_observed = max(all_labels)
             class_counts = [all_labels.count(i) for i in range(num_classes)]
         else:
             class_counts_dict = {}
             for batch_idx, (_, labels) in enumerate(train_loader):
                 labels = labels.cpu().numpy()
                 for label in labels:
-                    class_counts_dict[label] = class_counts_dict.get(label, 0) + 1
+                    label_int = int(label)
+                    max_label_observed = max(max_label_observed, label_int)
+                    class_counts_dict[label_int] = class_counts_dict.get(label_int, 0) + 1
                 if batch_idx >= 100: break
-            num_classes = self.config['benchmark'].get('total_classes', 7)
             class_counts = [class_counts_dict.get(i, 0) for i in range(num_classes)]
+
+        if max_label_observed >= num_classes:
+            raise RuntimeError(
+                f"Label range mismatch at task {task_id}: observed max label {max_label_observed}, "
+                f"but classifier outputs only {num_classes} classes."
+            )
         
         safe_counts = [c if c > 0 else 1 for c in class_counts]
         self.criterion = ClassBalancedLoss(
@@ -1085,6 +1255,14 @@ class ContinualLearner:
         self.metrics.print_summary(task_id)
         if self.use_amca and self.amca_tester is not None:
             self.amca_tester.print_summary()
+
+        if self._model_has_nonfinite_parameters():
+            print(
+                f"[WARNING] Task {task_id} ended with non-finite parameters; "
+                "last-good snapshot not updated."
+            )
+        else:
+            self._snapshot_last_good_model(task_id)
     
     def _train_epoch(self, task_id: int, train_loader: DataLoader, epoch: int, collection_dict: Optional[Dict] = None):
         """Train for one epoch with Batched Replay and Logit Capture."""
@@ -1099,6 +1277,12 @@ class ContinualLearner:
         training_config = self.config.get('training', {})
         use_gradient_accumulation = training_config.get('use_gradient_accumulation', False)
         accumulation_steps = training_config.get('accumulation_steps', 1) if use_gradient_accumulation else 1
+        max_nonfinite_batches = max(
+            1,
+            int(training_config.get('max_nonfinite_batches_per_epoch', 5))
+        )
+        nonfinite_batches = 0
+        has_pending_grad = False
         
         self.optimizer.zero_grad(set_to_none=True)
         
@@ -1174,6 +1358,22 @@ class ContinualLearner:
                     collected_count += int(selected_labels.numel())
 
                 outputs_float = outputs.float()
+
+                num_output_classes = int(outputs_float.size(1))
+                if self.criterion is not None and hasattr(self.criterion, 'weights'):
+                    weight_count = int(self.criterion.weights.numel())
+                    if weight_count != num_output_classes:
+                        raise RuntimeError(
+                            f"Class weight mismatch at task {task_id}: criterion has {weight_count} weights "
+                            f"but model outputs {num_output_classes} classes."
+                        )
+                if labels.numel() > 0:
+                    max_label_in_batch = int(labels.max().item())
+                    if max_label_in_batch >= num_output_classes:
+                        raise RuntimeError(
+                            f"Label out of range at task {task_id}: max label {max_label_in_batch}, "
+                            f"but model outputs {num_output_classes} classes."
+                        )
                 
                 if self.criterion is not None:
                     loss = self.criterion(outputs_float, labels)
@@ -1222,25 +1422,45 @@ class ContinualLearner:
                             else:
                                 with torch.amp.autocast('cuda', enabled=self.use_amp):
                                     r_out_dist = self.train_model(r_imgs)
-                                
-                            log_probs = F.log_softmax(r_out_dist.float() / self.replay_buffer.distillation_temp, dim=1)
-                            loss += 0.3 * F.kl_div(log_probs, soft_targets, reduction='batchmean')
+
+                            temp = max(float(self.replay_buffer.distillation_temp), 1e-6)
+                            log_probs = F.log_softmax(r_out_dist.float() / temp, dim=1)
+                            loss += 0.3 * (temp ** 2) * F.kl_div(log_probs, soft_targets, reduction='batchmean')
+
+                if not torch.isfinite(loss).all():
+                    nonfinite_batches += 1
+                    self.optimizer.zero_grad(set_to_none=True)
+                    has_pending_grad = False
+                    print(
+                        f"\n[WARNING] Non-finite loss at task {task_id}, epoch {epoch + 1}, "
+                        f"batch {batch_idx}; skipped ({nonfinite_batches}/{max_nonfinite_batches})"
+                    )
+                    if nonfinite_batches >= max_nonfinite_batches:
+                        raise RuntimeError(
+                            f"Too many non-finite losses in task {task_id}, epoch {epoch + 1}. "
+                            "Stopping to prevent model corruption."
+                        )
+                    continue
 
                 loss = loss / accumulation_steps
                 self.scaler.scale(loss).backward()
+                has_pending_grad = True
                 
                 if (batch_idx + 1) % accumulation_steps == 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.optimizer.zero_grad(set_to_none=True)
+                    if has_pending_grad:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        self.optimizer.zero_grad(set_to_none=True)
+                        has_pending_grad = False
                     
             except RuntimeError as e:
                 if "cuDNN" in str(e) or "CUDA" in str(e):
                     torch.cuda.empty_cache()
                     print(f"\nSkipped batch {batch_idx} due to CUDA error: {e}")
                     self.optimizer.zero_grad(set_to_none=True)
+                    has_pending_grad = False
                     continue
                 else:
                     raise
@@ -1253,7 +1473,7 @@ class ContinualLearner:
             
             pbar.set_postfix({'loss': f'{total_loss/(batch_idx+1):.4f}', 'acc': f'{100.*correct/total:.2f}%'})
         
-        if (batch_idx + 1) % accumulation_steps != 0:
+        if (batch_idx + 1) % accumulation_steps != 0 and has_pending_grad:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
@@ -1275,6 +1495,23 @@ class ContinualLearner:
         # Use pre-computed logits
         if 'logits' in collected_data and len(collected_data['logits']) > 0:
             all_logits = torch.cat(collected_data['logits'], dim=0)
+            finite_logits_mask = torch.isfinite(all_logits).all(dim=1)
+            finite_count = int(finite_logits_mask.sum().item())
+            if finite_count <= 0:
+                print(
+                    f"[WARNING] Replay update skipped for task {task_id}: "
+                    "all cached logits are non-finite."
+                )
+                return
+            if finite_count < all_logits.size(0):
+                dropped = int(all_logits.size(0) - finite_count)
+                print(
+                    f"[WARNING] Dropping {dropped} non-finite replay candidates "
+                    f"for task {task_id}."
+                )
+                all_images = all_images[finite_logits_mask]
+                all_labels = all_labels[finite_logits_mask]
+                all_logits = all_logits[finite_logits_mask]
             soft_targets = F.softmax(all_logits.float() / self.replay_buffer.distillation_temp, dim=1)
         else:
             print("Computing logits (fallback)")
@@ -1296,6 +1533,24 @@ class ContinualLearner:
                     
                     soft_targets_list.append(soft.cpu())
             soft_targets = torch.cat(soft_targets_list, dim=0)
+
+            finite_soft_mask = torch.isfinite(soft_targets).all(dim=1)
+            finite_count = int(finite_soft_mask.sum().item())
+            if finite_count <= 0:
+                print(
+                    f"[WARNING] Replay update skipped for task {task_id}: "
+                    "all computed soft targets are non-finite."
+                )
+                return
+            if finite_count < soft_targets.size(0):
+                dropped = int(soft_targets.size(0) - finite_count)
+                print(
+                    f"[WARNING] Dropping {dropped} non-finite fallback replay candidates "
+                    f"for task {task_id}."
+                )
+                all_images = all_images[finite_soft_mask]
+                all_labels = all_labels[finite_soft_mask]
+                soft_targets = soft_targets[finite_soft_mask]
         
         self.replay_buffer.add_samples(all_images, all_labels, task_id, soft_targets)
         print(f"Buffer updated.")
@@ -1324,6 +1579,12 @@ class ContinualLearner:
             return
         if len(self.replay_buffer) == 0:
             print(f"Replay buffer empty after task {task_id}; skipping auto-distillation")
+            return
+        if self._model_has_nonfinite_parameters():
+            print(
+                f"[WARNING] Skipping auto-distillation after task {task_id}: "
+                "model has non-finite parameters."
+            )
             return
 
         compression_ratio = replay_cfg.get('end_of_task_distill_compression_ratio', 0.9)
@@ -1385,8 +1646,9 @@ class ContinualLearner:
         print("Post-prune recovery complete")
 
     def _collect_prunable_adapter_candidates(self) -> List[Dict]:
-        """Collect removable adapter candidates while excluding adapters added in current task."""
+        """Collect removable adapter candidates with optional AMCA-aware Taylor scoring."""
         candidates = []
+        use_taylor_scoring = (self.pruning_importance == 'taylor')
 
         for layer_name in ["layer1", "layer2", "layer3", "layer4"]:
             if not hasattr(self.model, layer_name):
@@ -1408,16 +1670,19 @@ class ContinualLearner:
                         continue
 
                     # Lower score means lower importance and thus higher prune priority.
-                    l1_score = 0.0
+                    score = 0.0
                     for p in adapter.parameters():
-                        l1_score += float(p.detach().abs().sum().item())
+                        if use_taylor_scoring and p.grad is not None:
+                            score += float((p.detach() * p.grad.detach()).abs().sum().item())
+                        else:
+                            score += float(p.detach().abs().sum().item())
 
                     candidates.append({
                         'layer_name': layer_name,
                         'block_idx': int(block_idx),
                         'adapter_idx': int(adapter_idx),
                         'adapter_params': adapter_params,
-                        'score': l1_score
+                        'score': score
                     })
 
         return candidates
@@ -1438,11 +1703,24 @@ class ContinualLearner:
                     protected_module_ids.add(id(m))
 
         modules_to_prune = []
+        classifier_module = getattr(self.model, 'fc', None) if self.protect_classifier else None
         for module_name, module in self.model.named_modules():
             if not isinstance(module, (nn.Conv2d, nn.Linear)):
                 continue
             if not hasattr(module, 'weight'):
                 continue
+
+            if classifier_module is not None and module is classifier_module:
+                continue
+
+            weight = getattr(module, 'weight', None)
+            if weight is None:
+                continue
+            if hasattr(weight, 'requires_grad') and not bool(weight.requires_grad):
+                # Skip frozen tensors; Taylor importance cannot score parameters
+                # that do not receive gradients.
+                continue
+
             if id(module) in protected_module_ids:
                 continue
 
@@ -1563,6 +1841,11 @@ class ContinualLearner:
         ignored_layers = self._collect_structural_pruning_ignored_layers()
         before_effective = self._get_effective_model_params()
         before_total = int(self.model.get_num_parameters()) if hasattr(self.model, 'get_num_parameters') else int(sum(p.numel() for p in self.model.parameters()))
+        pre_prune_snapshot = None
+        try:
+            pre_prune_snapshot = copy.deepcopy(self.model).cpu()
+        except Exception as e:
+            print(f"[WARNING] Could not snapshot model before structural pruning at task {task_id}: {e}")
 
         try:
             self.model.eval()
@@ -1579,7 +1862,41 @@ class ContinualLearner:
                 pruning_ratio=float(prune_amount),
                 ignored_layers=ignored_layers,
             )
-            pruner.step()
+
+            try:
+                pruner.step()
+            except Exception as prune_error:
+                if importance_name == 'taylor':
+                    print(
+                        f"[WARNING] Taylor structural pruning failed at task {task_id}: {prune_error}. "
+                        "Retrying once with magnitude importance."
+                    )
+
+                    if pre_prune_snapshot is None:
+                        raise
+
+                    restored = copy.deepcopy(pre_prune_snapshot).to(self.device)
+                    if self.device == 'cuda':
+                        restored = restored.to(memory_format=torch.channels_last)
+                    self.model = restored
+                    self.train_model = self.model
+
+                    self.model.eval()
+                    with torch.no_grad():
+                        _ = self.model(example_inputs)
+
+                    fallback_importance = tp.importance.MagnitudeImportance(p=1)
+                    pruner = tp.pruner.MagnitudePruner(
+                        self.model,
+                        example_inputs=example_inputs,
+                        importance=fallback_importance,
+                        pruning_ratio=float(prune_amount),
+                        ignored_layers=ignored_layers,
+                    )
+                    pruner.step()
+                    importance_name = 'magnitude_fallback'
+                else:
+                    raise
 
             if self.device == 'cuda':
                 torch.cuda.empty_cache()
@@ -1619,6 +1936,22 @@ class ContinualLearner:
             )
             return True
         except Exception as e:
+            if pre_prune_snapshot is not None:
+                try:
+                    restored = pre_prune_snapshot.to(self.device)
+                    if self.device == 'cuda':
+                        restored = restored.to(memory_format=torch.channels_last)
+                    self.model = restored
+                    self.train_model = self.model
+                    print(
+                        f"[WARNING] Restored pre-prune snapshot after structural pruning failure "
+                        f"at task {task_id}."
+                    )
+                except Exception as restore_error:
+                    print(
+                        f"[WARNING] Could not restore pre-prune snapshot at task {task_id}: "
+                        f"{restore_error}"
+                    )
             print(f"[WARNING] Structural whole-model pruning failed after task {task_id}: {e}")
             return False
 
@@ -1644,6 +1977,45 @@ class ContinualLearner:
                 f"(interval_tasks={self.pruning_interval_tasks})"
             )
             return False
+
+        if self.pruning_scope == 'hybrid':
+            print(f"\n--- Executing HYBRID pruning at task {task_id} ---")
+
+            original_scope = self.pruning_scope
+            original_method = self.pruning_method
+            original_amount = self.pruning_amount
+            original_budget_driven = self.pruning_budget_driven
+
+            whole_model_success = False
+            adapter_success = False
+            try:
+                # Step 1: Gentle global squeeze to counter cumulative expansion.
+                self.pruning_scope = 'whole_model'
+                self.pruning_method = 'structural'
+                self.pruning_budget_driven = False
+                self.pruning_amount = 0.015
+                whole_model_success = self._auto_structural_prune_whole_model(
+                    task_id=task_id,
+                    train_loader=train_loader
+                )
+
+                expected_num_classes = int(self.config.get('benchmark', {}).get('total_classes', 7))
+                self._ensure_classifier_head(expected_num_classes)
+
+                # Step 2: Aggressive cleanup of stale historical adapters.
+                self.pruning_scope = 'older_adapters_only'
+                self.pruning_amount = 0.30
+                adapter_success = self._auto_prune_network_end_of_task(
+                    task_id=task_id,
+                    train_loader=train_loader
+                )
+            finally:
+                self.pruning_scope = original_scope
+                self.pruning_method = original_method
+                self.pruning_amount = original_amount
+                self.pruning_budget_driven = original_budget_driven
+
+            return bool(whole_model_success or adapter_success)
 
         if self.pruning_scope == 'whole_model' and self.pruning_method == 'structural':
             return self._auto_structural_prune_whole_model(
@@ -1732,107 +2104,134 @@ class ContinualLearner:
             self.pruning_scope = 'whole_model'
             return self._auto_prune_network_end_of_task(task_id, train_loader=train_loader)
 
-        candidates = self._collect_prunable_adapter_candidates()
-        if not candidates:
-            print(
-                f"No removable adapters found for scope '{self.pruning_scope}' at task {task_id} "
-                "(current-task adapters are protected)."
-            )
-            return False
-
-        before_effective = self._get_effective_model_params()
-        total_candidate_params = int(sum(c['adapter_params'] for c in candidates))
-        if total_candidate_params <= 0:
-            print(f"No removable adapter parameters available at task {task_id}")
-            return False
-
-        prune_amount = self._resolve_budget_driven_prune_amount(
-            prunable_effective_params=total_candidate_params,
-            task_id=task_id
-        )
-        if prune_amount <= 0.0:
-            return False
-
-        target_prune_params = int(total_candidate_params * prune_amount)
-        if prune_amount > 0.0:
-            target_prune_params = max(1, target_prune_params)
-
-        candidates_sorted = sorted(candidates, key=lambda c: c['score'])
-        selected = []
-        removed_param_budget = 0
-        for candidate in candidates_sorted:
-            if removed_param_budget >= target_prune_params:
-                break
-            selected.append(candidate)
-            removed_param_budget += int(candidate['adapter_params'])
-
-        if not selected:
-            print(f"No adapters selected for pruning at task {task_id}")
-            return False
-
+        adapter_grad_state = []
         try:
-            indices_by_block = {}
-            for item in selected:
-                key = (item['layer_name'], item['block_idx'])
-                if key not in indices_by_block:
-                    indices_by_block[key] = []
-                indices_by_block[key].append(int(item['adapter_idx']))
+            if self.pruning_importance == 'taylor' and self.pruning_scope == 'older_adapters_only':
+                print("Populating Replay gradients to evaluate Adapter AMCA utility...")
 
-            removed_params = 0
-            removed_adapters = 0
+                # Adapter pruning happens after training where historical adapters are
+                # often frozen. Temporarily enable grads so Taylor can score them.
+                for _, _, adapter in self._iter_adapters():
+                    is_new_adapter = id(adapter) in self.current_task_new_adapter_ids
+                    if self.pruning_scope == 'older_adapters_only' and is_new_adapter:
+                        continue
+                    for p in adapter.parameters():
+                        adapter_grad_state.append((p, bool(p.requires_grad)))
+                        p.requires_grad = True
 
-            for (layer_name, block_idx), adapter_indices in indices_by_block.items():
-                layer = getattr(self.model, layer_name)
-                block = layer[block_idx]
-                adapters = getattr(block, 'adapters', None)
-                if adapters is None or len(adapters) == 0:
-                    continue
+                taylor_ready = self._prepare_taylor_gradients_for_pruning(train_loader=train_loader)
+                if not taylor_ready:
+                    print(
+                        "[WARNING] Could not prepare Taylor gradients for adapter pruning; "
+                        "falling back to magnitude scoring."
+                    )
 
-                keep_adapters = []
-                remove_set = set(adapter_indices)
-                for idx, adapter in enumerate(adapters):
-                    if idx in remove_set:
-                        removed_adapters += 1
-                        removed_params += int(sum(p.numel() for p in adapter.parameters()))
-                    else:
-                        keep_adapters.append(adapter)
+            candidates = self._collect_prunable_adapter_candidates()
+            if not candidates:
+                print(
+                    f"No removable adapters found for scope '{self.pruning_scope}' at task {task_id} "
+                    "(current-task adapters are protected)."
+                )
+                return False
 
-                block.adapters = nn.ModuleList(keep_adapters)
+            before_effective = self._get_effective_model_params()
+            total_candidate_params = int(sum(c['adapter_params'] for c in candidates))
+            if total_candidate_params <= 0:
+                print(f"No removable adapter parameters available at task {task_id}")
+                return False
 
-            after_effective = self._get_effective_model_params()
-            pruned_now = max(0, before_effective - after_effective)
-
-            # Keep tracking set aligned after structural deletions.
-            self.current_task_new_adapter_ids = {
-                adapter_id for adapter_id in self.current_task_new_adapter_ids
-                if any(id(adapter) == adapter_id for _, _, adapter in self._iter_adapters())
-            }
-
-            self.pruning_history.append({
-                'task_id': int(task_id),
-                'scope': self.pruning_scope,
-                'method': 'adapter_delete',
-                'amount': float(prune_amount),
-                'effective_params_before': int(before_effective),
-                'effective_params_after': int(after_effective),
-                'pruned_params': int(pruned_now),
-                'removed_params': int(removed_params),
-                'removed_adapters': int(removed_adapters),
-                'candidate_params': int(total_candidate_params),
-                'target_prune_params': int(target_prune_params)
-            })
-
-            print(
-                f"Auto-pruned at end of task {task_id}: "
-                f"scope={self.pruning_scope}, amount={prune_amount:.4f}, "
-                f"effective params {before_effective:,} -> {after_effective:,} "
-                f"(freed {pruned_now:,}, removed_adapters={removed_adapters}, "
-                f"removed_params={removed_params:,})"
+            prune_amount = self._resolve_budget_driven_prune_amount(
+                prunable_effective_params=total_candidate_params,
+                task_id=task_id
             )
-            return True
-        except Exception as e:
-            print(f"[WARNING] Auto network pruning failed after task {task_id}: {e}")
-            return False
+            if prune_amount <= 0.0:
+                return False
+
+            target_prune_params = int(total_candidate_params * prune_amount)
+            if prune_amount > 0.0:
+                target_prune_params = max(1, target_prune_params)
+
+            candidates_sorted = sorted(candidates, key=lambda c: c['score'])
+            selected = []
+            removed_param_budget = 0
+            for candidate in candidates_sorted:
+                if removed_param_budget >= target_prune_params:
+                    break
+                selected.append(candidate)
+                removed_param_budget += int(candidate['adapter_params'])
+
+            if not selected:
+                print(f"No adapters selected for pruning at task {task_id}")
+                return False
+
+            try:
+                indices_by_block = {}
+                for item in selected:
+                    key = (item['layer_name'], item['block_idx'])
+                    if key not in indices_by_block:
+                        indices_by_block[key] = []
+                    indices_by_block[key].append(int(item['adapter_idx']))
+
+                removed_params = 0
+                removed_adapters = 0
+
+                for (layer_name, block_idx), adapter_indices in indices_by_block.items():
+                    layer = getattr(self.model, layer_name)
+                    block = layer[block_idx]
+                    adapters = getattr(block, 'adapters', None)
+                    if adapters is None or len(adapters) == 0:
+                        continue
+
+                    keep_adapters = []
+                    remove_set = set(adapter_indices)
+                    for idx, adapter in enumerate(adapters):
+                        if idx in remove_set:
+                            removed_adapters += 1
+                            removed_params += int(sum(p.numel() for p in adapter.parameters()))
+                        else:
+                            keep_adapters.append(adapter)
+
+                    block.adapters = nn.ModuleList(keep_adapters)
+
+                after_effective = self._get_effective_model_params()
+                pruned_now = max(0, before_effective - after_effective)
+
+                # Keep tracking set aligned after structural deletions.
+                self.current_task_new_adapter_ids = {
+                    adapter_id for adapter_id in self.current_task_new_adapter_ids
+                    if any(id(adapter) == adapter_id for _, _, adapter in self._iter_adapters())
+                }
+
+                self.pruning_history.append({
+                    'task_id': int(task_id),
+                    'scope': self.pruning_scope,
+                    'method': 'adapter_delete',
+                    'amount': float(prune_amount),
+                    'importance': ('taylor' if self.pruning_importance == 'taylor' else 'magnitude'),
+                    'effective_params_before': int(before_effective),
+                    'effective_params_after': int(after_effective),
+                    'pruned_params': int(pruned_now),
+                    'removed_params': int(removed_params),
+                    'removed_adapters': int(removed_adapters),
+                    'candidate_params': int(total_candidate_params),
+                    'target_prune_params': int(target_prune_params)
+                })
+
+                print(
+                    f"Auto-pruned at end of task {task_id}: "
+                    f"scope={self.pruning_scope}, amount={prune_amount:.4f}, "
+                    f"effective params {before_effective:,} -> {after_effective:,} "
+                    f"(freed {pruned_now:,}, removed_adapters={removed_adapters}, "
+                    f"removed_params={removed_params:,})"
+                )
+                return True
+            except Exception as e:
+                print(f"[WARNING] Auto network pruning failed after task {task_id}: {e}")
+                return False
+        finally:
+            for param, original_requires_grad in adapter_grad_state:
+                param.requires_grad = original_requires_grad
+            self.model.zero_grad(set_to_none=True)
 
     def _resolve_location_for_dataset_index(self, dataset, idx: int):
         """Resolve location string for an index from wrapped/concat/subset datasets."""
@@ -1962,11 +2361,18 @@ class ContinualLearner:
         return int(delta)
 
     def _get_num_classes(self, dataloader: DataLoader) -> int:
-        labels = set()
+        configured = int(self.config.get('benchmark', {}).get('total_classes', 0))
+        if configured > 0:
+            return configured
+
+        max_label = -1
         for _, batch_labels in dataloader:
-            labels.update(batch_labels.tolist())
-            if len(labels) >= 100: break
-        return len(labels)
+            if torch.is_tensor(batch_labels) and batch_labels.numel() > 0:
+                max_label = max(max_label, int(batch_labels.max().item()))
+            if max_label >= 100:
+                break
+
+        return max_label + 1 if max_label >= 0 else 1
 
     def save_checkpoint(self, path: str, task_id: int):
         os.makedirs(os.path.dirname(path), exist_ok=True)

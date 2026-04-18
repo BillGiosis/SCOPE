@@ -18,13 +18,26 @@ class ClassBalancedLoss(nn.Module):
             reduction: 'mean', 'sum', or 'none'
         """
         super(ClassBalancedLoss, self).__init__()
-        
-        # Compute effective number of samples
-        effective_num = 1.0 - torch.pow(beta, torch.tensor(class_counts, dtype=torch.float))
-        weights = (1.0 - beta) / effective_num
-        
-        # Normalize weights
-        weights = weights / weights.sum() * len(weights)
+
+        beta = float(beta)
+        counts = torch.tensor(class_counts, dtype=torch.float)
+        counts = torch.clamp(counts, min=0.0)
+
+        # Compute effective numbers only for classes seen in current task.
+        # Unseen classes get zero weight instead of inf/nan.
+        effective_num = 1.0 - torch.pow(beta, counts)
+        weights = torch.zeros_like(effective_num)
+        valid_mask = counts > 0
+        if valid_mask.any():
+            weights[valid_mask] = (1.0 - beta) / torch.clamp(effective_num[valid_mask], min=1e-12)
+
+            valid_sum = torch.clamp(weights[valid_mask].sum(), min=1e-12)
+            weights[valid_mask] = weights[valid_mask] / valid_sum * float(valid_mask.sum().item())
+        else:
+            # Degenerate fallback; keep finite uniform weights.
+            weights = torch.ones_like(weights)
+
+        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
         
         self.register_buffer('weights', weights)
         self.reduction = reduction

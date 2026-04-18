@@ -16,14 +16,12 @@ class ReplayBuffer:
     
     def __init__(
         self,
-        initial_size: int = 900,
         max_size: int = 1000,
         distillation_temp: float = 1.5,
         storage_device: str = 'cpu', 
         use_fp16: bool = True
     ):
-        self.max_size = max_size
-        self.current_max_size = initial_size
+        self.max_size = max(1, int(max_size))
         self.distillation_temp = distillation_temp
         self.storage_device = storage_device
         self.use_fp16 = use_fp16
@@ -120,7 +118,7 @@ class ReplayBuffer:
             cpu_soft = soft_targets.detach().to(device=self.storage_device, dtype=target_img_dtype, non_blocking=True)
 
         # Fill available free slots first.
-        free_slots = max(0, self.current_max_size - self.num_samples)
+        free_slots = max(0, self.max_size - self.num_samples)
         fill_count = min(batch_size, free_slots)
 
         if fill_count > 0:
@@ -149,7 +147,7 @@ class ReplayBuffer:
             if cpu_soft is not None:
                 self.soft_targets[overflow_indices] = cpu_soft[fill_count:fill_count + overflow_count]
 
-        self.num_samples = min(self.num_samples, self.current_max_size)
+        self.num_samples = min(self.num_samples, self.max_size)
 
     def get_batch(self, batch_size: int, task_id: Optional[int] = None, device='cuda') -> Dict:
         """Fully Vectorized Retrieval with Cached Weights."""
@@ -170,8 +168,10 @@ class ReplayBuffer:
                 
                 # Compute weights
                 counts = torch.bincount(current_labels)
-                # Weights = 1 / count
-                weights = 1.0 / (counts[current_labels].float() + 1e-6)
+                class_counts = counts[current_labels].float().clamp_min(1.0)
+                weights = class_counts.rsqrt()
+                weights = weights / weights.mean().clamp_min(1e-6)
+                weights = torch.clamp(weights, min=0.5, max=2.0)
                 self.sampling_weights = weights
             
             # Weighted sampling using cached weights
@@ -190,16 +190,11 @@ class ReplayBuffer:
             'soft_targets': b_soft.to(device, non_blocking=True) if b_soft is not None else None
         }
 
-    def expand(self, new_size: int):
-        if new_size > self.max_size: new_size = self.max_size
-        if new_size > self.current_max_size:
-            self.current_max_size = new_size
-
     def distill(self, model: nn.Module, compression_ratio: float = None, target_size: int = None, device='cuda'):
         """Optimized Distillation."""
         if self.num_samples == 0: return
         if target_size is None:
-            target_size = int(self.current_max_size * 0.9) if compression_ratio is None else int(self.num_samples * compression_ratio)
+            target_size = int(self.max_size * 0.9) if compression_ratio is None else int(self.num_samples * compression_ratio)
         target_size = max(1, min(target_size, self.num_samples))
         if self.num_samples <= target_size: return
 
@@ -264,9 +259,8 @@ class ReplayBuffer:
         if not self.initialized:
             return 0.0
 
-        # Report logical memory budget based on active capacity, not full
-        # preallocated storage, so RL penalties reflect expand/distill actions.
-        slots = self.current_max_size
+        # Report logical memory budget based on fixed configured replay capacity.
+        slots = self.max_size
         element_size = self.images.element_size()
 
         image_elements_per_sample = self.images[0].numel()

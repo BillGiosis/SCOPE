@@ -28,13 +28,12 @@ training:
 
 replay_buffer:
   enabled: true  # Enable/disable replay buffer
-  initial_size: 900  # Start near max for better rare class coverage
   max_size: 1000  # CLAD-C challenge limit
   samples_per_class: 200
   distillation_temp: 1.5
   replay_batch_size: 32
   auto_distill_end_of_task: true  # Distill automatically at each task boundary
-  end_of_task_distill_compression_ratio: 0.96  # Keep top 96% by entropy importance
+  end_of_task_distill_compression_ratio: 0.90  # Keep top 90% by entropy importance
 
 data_loading:
   num_workers: 8  # Parallel data loading
@@ -43,24 +42,25 @@ data_loading:
 
 network_expansion:
   enabled: true
-  strategy: "all_layers"  # Options: "all_layers" or "layer2_layer3_split"
+  strategy: "layer2_layer3_split"  # Options: "all_layers" or "layer2_layer3_split"
   # all_layers: budget-aware, evenly distributed across layer1-4 each task start
   # strategy: "layer2_layer3_split"  # Expands both layer2 and layer3 each task (50/50)
 
 network_pruning:
   enabled: true
-  amount: 0.01  # Maximum fraction pruned at task end (applied by scope)
+  amount: 0.05  # Maximum fraction pruned at task end (applied by scope)
   warmup_tasks: 2  # Do not prune during first N tasks to protect early AMCA
   interval_tasks: 1  # Run pruning every N tasks after warmup
-  budget_driven: true  # Prune only as needed to reopen next-task expansion budget
-  min_amount: 0.0
-  max_amount: 0.01
-  scope: "whole_model"  # Options: "whole_model", "older_adapters_only", or "all_adapters"
+  budget_driven: false  # Prune only as needed to reopen next-task expansion budget
+  min_amount: 0.02
+  max_amount: 0.15
+  scope: "hybrid"  # Options: "whole_model", "older_adapters_only", "all_adapters", or "hybrid"
+  # hybrid: gentle structural whole-model squeeze + aggressive older-adapter cleanup
   method: "structural"  # Options: "structural" (torch-pruning) or "unstructured"
   importance: "taylor"  # Options: "magnitude" or "taylor"
   use_replay_for_taylor: true
-  taylor_replay_batches: 3
-  taylor_train_batches: 0  # Keep Taylor scoring replay-driven by default
+  taylor_replay_batches: 8
+  taylor_train_batches: 2  # Add a small train signal for better saliency ranking
   taylor_replay_batch_size: 32
   rebuild_optimizer_after_prune: true
   recompile_after_prune: true
@@ -70,12 +70,12 @@ network_pruning:
   protect_downsample: true
   rollback:
     enabled: true
-    max_mca_drop: 0.01
-    eval_max_batches: 20
+    max_mca_drop: 0.015
+    eval_max_batches: 40
   recovery:
     enabled: true
     epochs: 5
-    learning_rate_scale: 0.18
+    learning_rate_scale: 0.2
   validation:
     report_efficiency_metrics: true
     latency_warmup_runs: 5

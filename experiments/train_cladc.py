@@ -108,7 +108,6 @@ def main(args):
     print("\nCreating replay buffer")
     buffer_config = config['replay_buffer']
     replay_buffer = ReplayBuffer(
-        initial_size=buffer_config['initial_size'],
         max_size=buffer_config['max_size'],
         distillation_temp=buffer_config['distillation_temp']
     )
@@ -224,7 +223,7 @@ def main(args):
         f.write(f"Replay Buffer:\n")
         f.write(f"  Replay Buffer Enabled: {config['replay_buffer'].get('enabled', True)}\n")
         f.write(f"  Max Size: {config['replay_buffer']['max_size']}\n")
-        f.write(f"  Initial Size: {config['replay_buffer']['initial_size']}\n")
+        f.write("  Capacity Policy: fixed at max_size\n")
         f.write(f"  Distillation Temp: {config['replay_buffer']['distillation_temp']}\n")
         f.write(f"  Replay Batch Size: {config['replay_buffer']['replay_batch_size']}\n\n")
         
