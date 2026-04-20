@@ -16,7 +16,6 @@ training:
   learning_rate: 0.0001
   optimizer: "adamw"
   weight_decay: 0.01
-  eval_frequency: 70  # Evaluate every N epochs
   use_amp: true  # Enable automatic mixed precision on CUDA
 
   # Gradient accumulation
@@ -24,7 +23,7 @@ training:
   accumulation_steps: 4  # Effective batch size = batch_size * accumulation_steps
 
   # Class-Balanced Loss
-  cb_beta: 0.99  # Class-balanced loss beta
+  cb_beta: 0.9999  # Class-balanced loss beta
 
 replay_buffer:
   enabled: true  # Enable/disable replay buffer
@@ -51,12 +50,15 @@ network_pruning:
   amount: 0.05  # Maximum fraction pruned at task end (applied by scope)
   warmup_tasks: 2  # Do not prune during first N tasks to protect early AMCA
   interval_tasks: 1  # Run pruning every N tasks after warmup
-  budget_driven: false  # Prune only as needed to reopen next-task expansion budget
   min_amount: 0.02
   max_amount: 0.15
   scope: "hybrid"  # Options: "whole_model", "older_adapters_only", "all_adapters", or "hybrid"
-  # hybrid: gentle structural whole-model squeeze + aggressive older-adapter cleanup
+  # hybrid: gentle structural whole-model squeeze + safer adapter cleanup
   method: "structural"  # Options: "structural" (torch-pruning) or "unstructured"
+  hybrid:
+    whole_model_amount: 0.01
+    adapter_amount: 0.30
+    adapter_scope: "older_adapters_only"  # "older_adapters_only" or "all_adapters"
   importance: "taylor"  # Options: "magnitude" or "taylor"
   use_replay_for_taylor: true
   taylor_replay_batches: 8
@@ -64,7 +66,6 @@ network_pruning:
   taylor_replay_batch_size: 32
   rebuild_optimizer_after_prune: true
   recompile_after_prune: true
-  example_input_shape: [1, 3, 224, 224]
   protect_current_task_adapters: true
   protect_classifier: true
   protect_downsample: true

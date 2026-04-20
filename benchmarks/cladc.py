@@ -32,7 +32,7 @@ finally:
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from typing import List, Dict
+from typing import List, Dict, Optional
 import numpy as np
 
 class CLADCDatasetWrapper(Dataset):
@@ -152,6 +152,7 @@ class CLADCBenchmark:
         print("Loading official CLAD-C datasets")
         self._train_sets = clad.get_cladc_train(root_dir, img_size=64)
         self._val_set = clad.get_cladc_val(root_dir, img_size=64)
+        self._cached_test_loader: Optional[DataLoader] = None
         print(f"Loaded {len(self._train_sets)} training tasks")
 
     def get_task_dataloader(
@@ -192,9 +193,10 @@ class CLADCBenchmark:
         shuffle = train
         if train and len(dataset) > 0:
             labels = dataset.targets
+            label_tensor = torch.as_tensor(labels, dtype=torch.long)
 
             # Compute class counts and weights (labels are 1-6)
-            class_counts = torch.bincount(torch.tensor(labels))
+            class_counts = torch.bincount(label_tensor)
 
             # Only compute weights for classes that exist
             class_weights = torch.zeros_like(class_counts, dtype=torch.float32)
@@ -202,7 +204,7 @@ class CLADCBenchmark:
                 if class_counts[i] > 0:
                     class_weights[i] = 1.0 / class_counts[i].float()
 
-            sample_weights = torch.tensor([class_weights[label] for label in labels])
+            sample_weights = class_weights[label_tensor]
 
             from torch.utils.data import WeightedRandomSampler
             sampler = WeightedRandomSampler(
@@ -229,8 +231,9 @@ class CLADCBenchmark:
 
     def get_all_test_dataloaders(self) -> List[DataLoader]:
         """Get test dataloaders for all tasks (for evaluation)."""
-        loader = self.get_task_dataloader(0, train=False, batch_size=32)
-        return [loader]
+        if self._cached_test_loader is None:
+            self._cached_test_loader = self.get_task_dataloader(0, train=False, batch_size=32)
+        return [self._cached_test_loader]
 
     def get_task_info(self, task_id: int) -> Dict:
         """Get information about a specific task."""

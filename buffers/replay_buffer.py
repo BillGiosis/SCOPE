@@ -149,8 +149,12 @@ class ReplayBuffer:
 
         self.num_samples = min(self.num_samples, self.max_size)
 
-    def get_batch(self, batch_size: int, task_id: Optional[int] = None, device='cuda') -> Dict:
-        """Fully Vectorized Retrieval with Cached Weights."""
+    def get_batch(self, batch_size: int, task_id: Optional[int] = None, device: Optional[str] = None) -> Dict:
+        """Fully vectorized retrieval with cached weights.
+
+        Returns tensors on the buffer storage device by default. If ``device`` is
+        provided, tensors are moved to that device before returning.
+        """
         if self.num_samples == 0: return None
         
         if task_id is not None:
@@ -183,6 +187,14 @@ class ReplayBuffer:
         b_tasks = self.task_ids[batch_indices]
         b_soft = self.soft_targets[batch_indices] if self.soft_targets is not None else None
         
+        if device is None:
+            return {
+                'images': b_images,
+                'labels': b_labels,
+                'task_ids': b_tasks,
+                'soft_targets': b_soft
+            }
+
         return {
             'images': b_images.to(device, non_blocking=True),
             'labels': b_labels.to(device, non_blocking=True),

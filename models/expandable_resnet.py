@@ -39,7 +39,6 @@ class ExpandableBottleneck(nn.Module):
         self.downsample = downsample
         self.stride = stride
         self.adapters = nn.ModuleList()
-        self.frozen = False
         
     def add_adapter(self, reduction=16):
         input_dim = self.conv1.in_channels
@@ -54,16 +53,6 @@ class ExpandableBottleneck(nn.Module):
             return True
         return False
         
-    def freeze(self):
-        self.frozen = True
-        for param in [self.conv1, self.bn1, self.conv2, self.bn2, 
-                     self.conv3, self.bn3]:
-            for p in param.parameters():
-                p.requires_grad = False
-        if self.downsample is not None:
-            for p in self.downsample.parameters():
-                p.requires_grad = False
-                
     def forward(self, x):
         identity = x
         
@@ -164,7 +153,6 @@ class ExpandableResNet(nn.Module):
             
         self.fc = None
         self.num_classes = num_classes
-        self.frozen_modules = set()
         self.expansion_history = []
         
     def add_task_head(self, num_classes: int):
@@ -192,30 +180,6 @@ class ExpandableResNet(nn.Module):
         else:
             print(f"No blocks in {layer_name} were eligible for adapters (stride/dim mismatch)")
             
-    def freeze_module(self, module_name: str):
-        if module_name == 'fc' and self.fc is not None:
-            for param in self.fc.parameters():
-                param.requires_grad = False
-            self.frozen_modules.add(module_name)
-        elif hasattr(self, module_name):
-            module = getattr(self, module_name)
-            for param in module.parameters():
-                param.requires_grad = False
-            self.frozen_modules.add(module_name)
-        else:
-            raise ValueError(f"Module {module_name} not found")
-            
-    def unfreeze_module(self, module_name: str):
-        if module_name in self.frozen_modules:
-            if module_name == 'fc' and self.fc is not None:
-                for param in self.fc.parameters():
-                    param.requires_grad = True
-            elif hasattr(self, module_name):
-                module = getattr(self, module_name)
-                for param in module.parameters():
-                    param.requires_grad = True
-            self.frozen_modules.discard(module_name)
-    
     def get_features(self, x):
         x = self.conv1(x)
         x = self.bn1(x)

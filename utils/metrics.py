@@ -4,7 +4,7 @@ Metrics and evaluation utilities for continual learning.
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from collections import defaultdict
 import time
@@ -28,34 +28,46 @@ class AMCATester:
         self,
         model: nn.Module,
         dataloader,
-        device: str = 'cuda'
-    ) -> Dict[str, float]:
+        device: str = 'cuda',
+        show_progress: bool = False
+    ) -> Dict[str, Union[float, np.ndarray]]:
         """
         Evaluate model and compute per-class accuracies using vectorized operations.
         """
-        from tqdm import tqdm
-        
         model.eval()
+        use_cuda = str(device).startswith('cuda')
         
         max_cls = self.num_classes + 1
         class_correct_tensor = torch.zeros(max_cls, device=device, dtype=torch.long)
         class_total_tensor = torch.zeros(max_cls, device=device, dtype=torch.long)
-        
-        with torch.no_grad():
-            pbar = tqdm(dataloader, desc="AMCA Evaluation", leave=False)
-            for images, labels in pbar:
-                images = images.to(device, non_blocking=True)
+
+        with torch.inference_mode():
+            iterator = dataloader
+            if show_progress:
+                from tqdm import tqdm
+                iterator = tqdm(dataloader, desc="AMCA Evaluation", leave=False)
+
+            for images, labels in iterator:
+                if use_cuda:
+                    images = images.to(
+                        device,
+                        dtype=torch.float32,
+                        non_blocking=True,
+                        memory_format=torch.channels_last
+                    )
+                else:
+                    images = images.to(device, dtype=torch.float32, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
-                
+
                 # Standard forward pass
                 outputs = model(images)
-                
+
                 _, predicted = outputs.max(1)
-                
+
                 # Vectorized per-class counting
                 # bincount requires 1D non-negative
                 class_total_tensor += torch.bincount(labels, minlength=max_cls)[:max_cls]
-                
+
                 correct_mask = (predicted == labels)
                 class_correct_tensor += torch.bincount(labels[correct_mask], minlength=max_cls)[:max_cls]
         
@@ -95,6 +107,37 @@ class AMCATester:
         if len(self.mean_class_accuracies) == 0:
             return 0.0
         return float(np.mean(self.mean_class_accuracies))
+
+    def record_from_per_class_dict(
+        self,
+        per_class_acc: Dict[int, float],
+        overall_accuracy: Optional[float] = None
+    ) -> Dict[str, Union[float, np.ndarray]]:
+        """Record AMCA statistics from an existing per-class accuracy dictionary."""
+        class_accuracies = np.zeros(self.num_classes, dtype=np.float64)
+        valid_mask = np.zeros(self.num_classes, dtype=bool)
+
+        for class_id, acc in per_class_acc.items():
+            if 0 <= int(class_id) < self.num_classes:
+                class_accuracies[int(class_id)] = float(acc)
+                valid_mask[int(class_id)] = True
+
+        self.class_accuracies_over_time.append(class_accuracies.copy())
+
+        if valid_mask.any():
+            mca = float(class_accuracies[valid_mask].mean())
+        else:
+            mca = 0.0
+        self.mean_class_accuracies.append(mca)
+
+        if overall_accuracy is None:
+            overall_accuracy = 0.0
+
+        return {
+            'class_accuracies': class_accuracies,
+            'mean_class_accuracy': float(mca),
+            'overall_accuracy': float(overall_accuracy)
+        }
     
     def get_summary(self) -> Dict:
         return {
@@ -221,7 +264,7 @@ class MetricsTracker:
                 # Use most recent accuracy
                 accuracies.append(self.task_accuracies[task_id][-1])
         
-        return np.mean(accuracies) if accuracies else 0.0
+        return float(np.mean(accuracies)) if accuracies else 0.0
     
     def get_forgetting(self, current_task: int) -> float:
         """Calculate average forgetting."""
@@ -237,7 +280,7 @@ class MetricsTracker:
                 forgetting = max(0, best_acc - current_acc)
                 forgetting_scores.append(forgetting)
         
-        return np.mean(forgetting_scores) if forgetting_scores else 0.0
+        return float(np.mean(forgetting_scores)) if forgetting_scores else 0.0
     
     def get_current_memory(self) -> float:
         return self.memory_usage[-1] if self.memory_usage else 0.0
@@ -283,14 +326,14 @@ def evaluate_model(
     dataloader,
     task_id: int,
     device: str = 'cuda',
-    return_per_class: bool = False
+    return_per_class: bool = False,
+    show_progress: bool = False
 ) -> Union[float, Tuple[float, Dict[int, float]]]:
     """
     Evaluate model on a specific task with vectorized GPU operations.
     """
-    from tqdm import tqdm
-    
     model.eval()
+    use_cuda = str(device).startswith('cuda')
     
     # Initialize tensors on GPU
     max_cls = 20 
@@ -299,34 +342,51 @@ def evaluate_model(
     
     total_samples = 0
     total_correct = 0
+    progress_update_interval = 10
+    total_batches = len(dataloader)
     
-    # Track prediction distribution for debugging    
-    with torch.no_grad():
-        pbar = tqdm(dataloader, desc=f"Task {task_id}", leave=False)
-        for images, labels in pbar:
-            images = images.to(device, non_blocking=True)
+    # Track prediction distribution for debugging
+    with torch.inference_mode():
+        iterator = dataloader
+        if show_progress:
+            from tqdm import tqdm
+            iterator = tqdm(dataloader, desc=f"Task {task_id}", leave=False)
+
+        for batch_idx, (images, labels) in enumerate(iterator):
+            if use_cuda:
+                images = images.to(
+                    device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                    memory_format=torch.channels_last
+                )
+            else:
+                images = images.to(device, dtype=torch.float32, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            
+
             # Forward pass
             outputs = model(images)
-            
+
             _, predicted = outputs.max(1)
-            
+
             # Global stats
             batch_correct = predicted.eq(labels).sum().item()
             total_correct += batch_correct
             total_samples += labels.size(0)
-            
+
             if return_per_class:
                 # Vectorized class counting
                 total_class_counts += torch.bincount(labels, minlength=max_cls)[:max_cls]
-                
+
                 mask = (predicted == labels)
                 correct_class_counts += torch.bincount(labels[mask], minlength=max_cls)[:max_cls]
-            
+
             # Update progress bar
-            if total_samples > 0:
-                pbar.set_postfix({'acc': f'{100.0 * total_correct / total_samples:.2f}%'})
+            if show_progress and total_samples > 0 and (
+                (batch_idx + 1) % progress_update_interval == 0
+                or (batch_idx + 1) == total_batches
+            ):
+                iterator.set_postfix({'acc': f'{100.0 * total_correct / total_samples:.2f}%'})
     
     accuracy = total_correct / total_samples if total_samples > 0 else 0.0
     
@@ -346,6 +406,176 @@ def evaluate_model(
         return accuracy, per_class_acc
     
     return accuracy
+
+
+def evaluate_model_with_locations(
+    model: nn.Module,
+    dataloader,
+    task_id: int,
+    device: str = 'cuda',
+    location_ids: Optional[torch.Tensor] = None,
+    location_names: Optional[List[str]] = None,
+    show_progress: bool = False
+) -> Dict:
+    """Evaluate once and return overall/per-class plus per-location metrics.
+
+    The optional ``location_ids`` tensor must align with dataset order in
+    ``dataloader`` (``shuffle=False``).
+    """
+    model.eval()
+    use_cuda = str(device).startswith('cuda')
+
+    max_cls = 20
+    total_class_counts = torch.zeros(max_cls, device=device, dtype=torch.long)
+    correct_class_counts = torch.zeros(max_cls, device=device, dtype=torch.long)
+
+    if location_names is None:
+        location_names = ['Citystreet', 'Countryroad', 'Highway']
+    num_locations = len(location_names)
+
+    use_location_stats = (
+        location_ids is not None
+        and torch.is_tensor(location_ids)
+        and location_ids.numel() > 0
+        and num_locations > 0
+    )
+
+    location_ids_cpu = None
+    location_total_samples = None
+    location_total_correct = None
+    location_total_class_counts = None
+    location_correct_class_counts = None
+
+    if use_location_stats:
+        assert location_ids is not None
+        location_ids_cpu = location_ids.detach().to(dtype=torch.long, device='cpu')
+        location_total_samples = torch.zeros(num_locations, device=device, dtype=torch.long)
+        location_total_correct = torch.zeros(num_locations, device=device, dtype=torch.long)
+        location_total_class_counts = torch.zeros(num_locations, max_cls, device=device, dtype=torch.long)
+        location_correct_class_counts = torch.zeros(num_locations, max_cls, device=device, dtype=torch.long)
+
+    total_samples = 0
+    total_correct = 0
+    sample_offset = 0
+    progress_update_interval = 10
+    total_batches = len(dataloader)
+
+    with torch.inference_mode():
+        iterator = dataloader
+        if show_progress:
+            from tqdm import tqdm
+            iterator = tqdm(dataloader, desc=f"Task {task_id}", leave=False)
+
+        for batch_idx, (images, labels) in enumerate(iterator):
+            if use_cuda:
+                images = images.to(
+                    device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                    memory_format=torch.channels_last
+                )
+            else:
+                images = images.to(device, dtype=torch.float32, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            outputs = model(images)
+            _, predicted = outputs.max(1)
+
+            batch_correct = predicted.eq(labels).sum().item()
+            total_correct += batch_correct
+            total_samples += labels.size(0)
+
+            total_class_counts += torch.bincount(labels, minlength=max_cls)[:max_cls]
+            correct_mask = (predicted == labels)
+            correct_class_counts += torch.bincount(labels[correct_mask], minlength=max_cls)[:max_cls]
+
+            if use_location_stats:
+                assert location_ids_cpu is not None
+                assert location_total_samples is not None
+                assert location_total_correct is not None
+                assert location_total_class_counts is not None
+                assert location_correct_class_counts is not None
+                batch_size = int(labels.size(0))
+                next_offset = sample_offset + batch_size
+
+                if next_offset <= int(location_ids_cpu.numel()):
+                    batch_location_ids = location_ids_cpu[sample_offset:next_offset].to(
+                        device,
+                        non_blocking=True
+                    )
+
+                    for loc_id in range(num_locations):
+                        loc_mask = (batch_location_ids == loc_id)
+                        if not bool(loc_mask.any().item()):
+                            continue
+
+                        loc_labels = labels[loc_mask]
+                        loc_preds = predicted[loc_mask]
+                        location_total_samples[loc_id] += int(loc_labels.size(0))
+                        location_total_correct[loc_id] += int(loc_preds.eq(loc_labels).sum().item())
+
+                        location_total_class_counts[loc_id] += torch.bincount(
+                            loc_labels,
+                            minlength=max_cls
+                        )[:max_cls]
+
+                        loc_correct_mask = loc_preds.eq(loc_labels)
+                        if bool(loc_correct_mask.any().item()):
+                            location_correct_class_counts[loc_id] += torch.bincount(
+                                loc_labels[loc_correct_mask],
+                                minlength=max_cls
+                            )[:max_cls]
+
+                sample_offset = next_offset
+
+            if show_progress and total_samples > 0 and (
+                (batch_idx + 1) % progress_update_interval == 0
+                or (batch_idx + 1) == total_batches
+            ):
+                iterator.set_postfix({'acc': f'{100.0 * total_correct / total_samples:.2f}%'})
+
+    accuracy = total_correct / total_samples if total_samples > 0 else 0.0
+
+    t_counts = total_class_counts.cpu().numpy()
+    c_counts = correct_class_counts.cpu().numpy()
+
+    per_class_acc = {}
+    for c in range(max_cls):
+        total = t_counts[c]
+        if total > 0:
+            per_class_acc[c] = c_counts[c] / total
+
+    location_accuracy = {}
+    location_per_class_acc = {}
+    if use_location_stats:
+        assert location_total_samples is not None
+        assert location_total_correct is not None
+        assert location_total_class_counts is not None
+        assert location_correct_class_counts is not None
+        loc_total_class_np = location_total_class_counts.cpu().numpy()
+        loc_correct_class_np = location_correct_class_counts.cpu().numpy()
+
+        for loc_id, location_name in enumerate(location_names):
+            loc_total = int(location_total_samples[loc_id].item())
+            if loc_total <= 0:
+                continue
+
+            loc_correct = int(location_total_correct[loc_id].item())
+            location_accuracy[location_name] = float(loc_correct / loc_total)
+
+            loc_per_class = {}
+            for c in range(max_cls):
+                cls_total = int(loc_total_class_np[loc_id][c])
+                if cls_total > 0:
+                    loc_per_class[c] = float(loc_correct_class_np[loc_id][c] / cls_total)
+            location_per_class_acc[location_name] = loc_per_class
+
+    return {
+        'accuracy': float(accuracy),
+        'per_class_acc': per_class_acc,
+        'location_accuracy': location_accuracy,
+        'location_per_class_acc': location_per_class_acc
+    }
 
 
 def compute_model_size(model: nn.Module) -> Dict[str, float]:
@@ -377,7 +607,7 @@ def compute_inference_efficiency(
     input_shape: Tuple[int, int, int, int] = (1, 3, 224, 224),
     warmup_runs: int = 5,
     measure_runs: int = 20
-) -> Dict[str, float]:
+) -> Dict[str, Union[str, Tuple[int, int, int, int], int, float]]:
     """
     Compute approximate MACs/FLOPs and measured inference latency.
 
@@ -453,7 +683,7 @@ def compute_inference_efficiency(
         elif isinstance(m, nn.Linear):
             hook_handles.append(m.register_forward_hook(linear_hook))
 
-    with torch.no_grad():
+    with torch.inference_mode():
         _ = model(sample)
 
     for h in hook_handles:
@@ -462,7 +692,7 @@ def compute_inference_efficiency(
     if run_device.type == 'cuda':
         torch.cuda.synchronize(run_device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(warmup_runs):
             _ = model(sample)
 
@@ -470,7 +700,7 @@ def compute_inference_efficiency(
         torch.cuda.synchronize(run_device)
 
     start = time.perf_counter()
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(measure_runs):
             _ = model(sample)
     if run_device.type == 'cuda':
@@ -479,13 +709,19 @@ def compute_inference_efficiency(
 
     latency_ms = (elapsed * 1000.0) / float(measure_runs)
     throughput_fps = 1000.0 / latency_ms if latency_ms > 0 else 0.0
+    input_shape_4 = (
+        int(input_shape[0]),
+        int(input_shape[1]),
+        int(input_shape[2]),
+        int(input_shape[3])
+    )
 
     if model_was_training:
         model.train()
 
     return {
         'device': str(run_device),
-        'input_shape': tuple(int(v) for v in input_shape),
+        'input_shape': input_shape_4,
         'macs': int(macs),
         'flops': int(macs * 2),
         'latency_ms': float(latency_ms),

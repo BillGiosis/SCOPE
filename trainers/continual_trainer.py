@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.nn.utils.prune as torch_prune
 import copy
-from torch.utils.data import DataLoader, ConcatDataset, Subset
+from torch.utils.data import DataLoader, ConcatDataset
 from typing import Dict, List, Optional
 import time
 import os
@@ -20,7 +20,13 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from models.expandable_resnet import ExpandableResNet
 from buffers.replay_buffer import ReplayBuffer
-from utils.metrics import MetricsTracker, AMCATester, evaluate_model, compute_model_size
+from utils.metrics import (
+    MetricsTracker,
+    AMCATester,
+    evaluate_model,
+    evaluate_model_with_locations,
+    compute_model_size
+)
 from utils.losses import ClassBalancedLoss
 
 
@@ -92,7 +98,6 @@ class ContinualLearner:
         self.learning_rate = config['training']['learning_rate']
         self.optimizer_name = config['training']['optimizer']
         self.weight_decay = config['training']['weight_decay']
-        self.eval_frequency = config['training'].get('eval_frequency', 5)
 
         expansion_cfg = config.get('network_expansion', {})
         self.expansion_enabled = expansion_cfg.get('enabled', True)
@@ -119,12 +124,14 @@ class ContinualLearner:
             )
         )
         self.pruning_warmup_tasks = max(0, int(pruning_cfg.get('warmup_tasks', 2)))
-        self.pruning_budget_driven = bool(pruning_cfg.get('budget_driven', True))
         self.pruning_min_amount = float(pruning_cfg.get('min_amount', 0.0))
         self.pruning_max_amount = float(pruning_cfg.get('max_amount', self.pruning_amount))
-        self.pruning_example_input_shape = tuple(
-            pruning_cfg.get('example_input_shape', [1, 3, 224, 224])
-        )
+        hybrid_cfg = pruning_cfg.get('hybrid', {})
+        self.hybrid_whole_model_amount = float(hybrid_cfg.get('whole_model_amount', 0.01))
+        self.hybrid_adapter_amount = float(hybrid_cfg.get('adapter_amount', 0.20))
+        self.hybrid_adapter_scope = str(
+            hybrid_cfg.get('adapter_scope', 'older_adapters_only')
+        ).strip().lower()
         self.rebuild_optimizer_after_prune = bool(
             pruning_cfg.get('rebuild_optimizer_after_prune', True)
         )
@@ -173,8 +180,16 @@ class ContinualLearner:
         self.pruning_amount = min(max(self.pruning_amount, 0.0), 1.0)
         self.pruning_min_amount = min(max(self.pruning_min_amount, 0.0), 1.0)
         self.pruning_max_amount = min(max(self.pruning_max_amount, 0.0), 1.0)
+        self.hybrid_whole_model_amount = min(max(self.hybrid_whole_model_amount, 0.0), 1.0)
+        self.hybrid_adapter_amount = min(max(self.hybrid_adapter_amount, 0.0), 1.0)
         if self.pruning_max_amount < self.pruning_min_amount:
             self.pruning_max_amount = self.pruning_min_amount
+        if self.hybrid_adapter_scope not in {'older_adapters_only', 'all_adapters'}:
+            print(
+                f"[WARNING] Unsupported network_pruning.hybrid.adapter_scope='{self.hybrid_adapter_scope}'. "
+                "Falling back to 'older_adapters_only'."
+            )
+            self.hybrid_adapter_scope = 'older_adapters_only'
         if self.pruning_importance not in {'magnitude', 'taylor'}:
             print(
                 f"[WARNING] Unsupported network_pruning.importance='{self.pruning_importance}'. "
@@ -183,8 +198,6 @@ class ContinualLearner:
             self.pruning_importance = 'magnitude'
         self.prune_rollback_max_mca_drop = max(0.0, self.prune_rollback_max_mca_drop)
         self.prune_recovery_lr_scale = max(self.prune_recovery_lr_scale, 0.0)
-        if len(self.pruning_example_input_shape) != 4:
-            self.pruning_example_input_shape = (1, 3, 224, 224)
 
         base_params = int(self._get_effective_model_params())
         max_ratio = float(config.get('benchmark', {}).get('max_params_ratio', 1.05))
@@ -204,6 +217,8 @@ class ContinualLearner:
         }
         self.last_good_model_snapshot: Optional[nn.Module] = None
         self.last_good_task_id: Optional[int] = None
+        self._cached_eval_loaders: Dict[int, DataLoader] = {}
+        self._cached_location_ids: Dict[int, torch.Tensor] = {}
 
     def _is_pruning_task(self, task_id: int) -> bool:
         """Return whether pruning should run for this task id under warmup/interval rules."""
@@ -287,12 +302,14 @@ class ContinualLearner:
 
         return int(sum(costs))
 
-    def _resolve_budget_driven_prune_amount(
+    def _resolve_prune_amount(
         self,
         prunable_effective_params: int,
         task_id: int
     ) -> float:
-        """Resolve pruning amount, optionally driven by next-task budget requirements."""
+        """Resolve pruning amount with fixed (non-budget-driven) behavior."""
+        del task_id
+
         configured_amount = min(max(float(self.pruning_amount), 0.0), 1.0)
         if configured_amount <= 0.0:
             return 0.0
@@ -300,45 +317,7 @@ class ContinualLearner:
         if prunable_effective_params <= 0:
             return 0.0
 
-        if not self.pruning_budget_driven:
-            return configured_amount
-
-        target_budget = self._estimate_budget_needed_for_next_task_expansion()
-        if target_budget <= 0:
-            print(
-                f"Budget-driven pruning skipped at task {task_id}: "
-                "no next-task expansion pressure detected"
-            )
-            return 0.0
-
-        available_budget = self._get_available_param_budget()
-        missing_budget = max(0, target_budget - available_budget)
-        if missing_budget <= 0:
-            print(
-                f"Budget-driven pruning skipped at task {task_id}: "
-                f"available budget {available_budget:,} already meets target {target_budget:,}"
-            )
-            return 0.0
-
-        required_fraction = float(missing_budget) / float(max(1, prunable_effective_params))
-        resolved_amount = max(self.pruning_min_amount, required_fraction)
-        resolved_amount = min(self.pruning_max_amount, resolved_amount)
-        resolved_amount = min(max(resolved_amount, 0.0), 1.0)
-
-        estimated_freed = int(prunable_effective_params * resolved_amount)
-        if estimated_freed < missing_budget:
-            print(
-                f"Budget-driven pruning at task {task_id} is capped by max_amount={self.pruning_max_amount:.4f}: "
-                f"needed~{missing_budget:,}, estimated_freed~{estimated_freed:,}"
-            )
-        else:
-            print(
-                f"Budget-driven pruning at task {task_id}: "
-                f"needed~{missing_budget:,}, prunable={prunable_effective_params:,}, "
-                f"resolved_amount={resolved_amount:.4f}"
-            )
-
-        return resolved_amount
+        return configured_amount
 
     def _get_all_layers_budget_aware_targets(self) -> List[str]:
         """
@@ -484,7 +463,8 @@ class ContinualLearner:
                 print(f"[WARNING] Could not derive pruning example input from loader: {e}")
 
         try:
-            shape = tuple(int(v) for v in self.pruning_example_input_shape)
+            # CLAD-C image fallback; normal path uses one sample from train_loader.
+            shape = (1, 3, 64, 64)
             example = torch.randn(*shape, device=self.device)
             if self.device == 'cuda':
                 example = example.contiguous(memory_format=torch.channels_last)
@@ -1120,13 +1100,24 @@ class ContinualLearner:
 
         if hasattr(train_loader.dataset, 'targets'):
             all_labels = train_loader.dataset.targets
-            if isinstance(all_labels, list) and len(all_labels) > 0 and torch.is_tensor(all_labels[0]):
-                all_labels = [l.item() for l in all_labels]
 
-            all_labels = [int(v) for v in all_labels]
-            if all_labels:
-                max_label_observed = max(all_labels)
-            class_counts = [all_labels.count(i) for i in range(num_classes)]
+            if torch.is_tensor(all_labels):
+                label_tensor = all_labels.detach().to(dtype=torch.long).cpu()
+            else:
+                if isinstance(all_labels, list) and len(all_labels) > 0 and torch.is_tensor(all_labels[0]):
+                    all_labels = [int(l.item()) for l in all_labels]
+                label_tensor = torch.as_tensor(all_labels, dtype=torch.long)
+
+            if label_tensor.numel() > 0:
+                max_label_observed = int(label_tensor.max().item())
+                non_negative_labels = label_tensor[label_tensor >= 0]
+                if non_negative_labels.numel() > 0:
+                    bincount = torch.bincount(non_negative_labels, minlength=num_classes)
+                    class_counts = bincount[:num_classes].tolist()
+                else:
+                    class_counts = [0 for _ in range(num_classes)]
+            else:
+                class_counts = [0 for _ in range(num_classes)]
         else:
             class_counts_dict = {}
             for batch_idx, (_, labels) in enumerate(train_loader):
@@ -1160,47 +1151,81 @@ class ContinualLearner:
                 all_test_datasets.append(test_loaders[tid].dataset)
         
         cached_test_loader = None
-        cached_location_loaders = None
+        cached_location_ids = None
         if all_test_datasets:
-            combined_test_dataset = ConcatDataset(all_test_datasets)
+            if len(all_test_datasets) == 1:
+                combined_test_dataset = all_test_datasets[0]
+            else:
+                combined_test_dataset = ConcatDataset(all_test_datasets)
+
             data_loading_config = self.config.get('data_loading', {})
             num_workers = min(data_loading_config.get('num_workers', 4), 8)
-            
-            cached_test_loader = DataLoader(
-                combined_test_dataset,
-                batch_size=128,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=data_loading_config.get('pin_memory', True),
-                prefetch_factor=2 if num_workers > 0 else None,
-                persistent_workers=True if num_workers > 0 else False
-            )
 
-            cached_location_loaders = self._build_location_loaders(
-                combined_test_dataset=combined_test_dataset,
-                batch_size=128,
-                num_workers=num_workers,
-                pin_memory=data_loading_config.get('pin_memory', True)
-            )
+            cache_key = id(combined_test_dataset)
+            if cache_key not in self._cached_eval_loaders:
+                self._cached_eval_loaders[cache_key] = DataLoader(
+                    combined_test_dataset,
+                    batch_size=128,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=data_loading_config.get('pin_memory', True),
+                    prefetch_factor=2 if num_workers > 0 else None,
+                    persistent_workers=True if num_workers > 0 else False
+                )
+            cached_test_loader = self._cached_eval_loaders[cache_key]
+
+            if cache_key not in self._cached_location_ids:
+                self._cached_location_ids[cache_key] = self._build_location_id_tensor(
+                    combined_test_dataset=combined_test_dataset
+                )
+            cached_location_ids = self._cached_location_ids[cache_key]
 
         # --- Training Loop ---
         replay_candidates = {'images': [], 'labels': [], 'logits': []} # Logits added for re-use
+        last_eval_snapshot = None
+        from tqdm import tqdm
+
+        task_total_steps = max(1, int(self.epochs_per_task))
+        task_progress_bar = tqdm(
+            total=task_total_steps,
+            desc=f"Task {task_id} Training",
+            unit='epoch',
+            bar_format='{l_bar}{bar:30}{r_bar}{bar:-10b}'
+        )
         
-        for epoch in range(self.epochs_per_task):
-            is_last_epoch = (epoch == self.epochs_per_task - 1)
-            collection_dict = replay_candidates if is_last_epoch else None
-            
-            self._train_epoch(task_id, train_loader, epoch, collection_dict)
-            
-            # Evaluations
-            if (epoch + 1) % self.eval_frequency == 0 or is_last_epoch:
-                print(f"\nEpoch {epoch + 1}/{self.epochs_per_task} - Evaluating")
-                self._evaluate_and_update_metrics(
+        try:
+            for epoch in range(self.epochs_per_task):
+                is_last_epoch = (epoch == self.epochs_per_task - 1)
+                collection_dict = replay_candidates if is_last_epoch else None
+
+                epoch_loss, epoch_acc = self._train_epoch(
                     task_id,
-                    cached_test_loader,
-                    location_loaders=cached_location_loaders,
-                    run_amca=False
+                    train_loader,
+                    epoch,
+                    collection_dict,
+                    task_progress_bar=task_progress_bar,
+                    epoch_total=self.epochs_per_task
                 )
+                task_progress_bar.set_postfix(
+                    {
+                        'loss': f'{epoch_loss:.4f}',
+                        'acc': f'{epoch_acc:.2f}%'
+                    },
+                    refresh=True
+                )
+                task_progress_bar.update(1)
+                
+                # Evaluate only at task end.
+                if is_last_epoch:
+                    print(f"\nEpoch {epoch + 1}/{self.epochs_per_task} - Evaluating")
+                    last_eval_snapshot = self._evaluate_and_update_metrics(
+                        task_id,
+                        cached_test_loader,
+                        location_ids=cached_location_ids,
+                        run_amca=False
+                    )
+        finally:
+            task_progress_bar.close()
             
         # --- Replay Buffer Update ---
         replay_enabled = self.config.get('replay_buffer', {}).get('enabled', True)
@@ -1236,15 +1261,41 @@ class ContinualLearner:
         )
         if rolled_back:
             prune_applied = False
-        
-        # Final Full Evaluation
-        print(f"\nFinal evaluation after task {task_id}:")
-        self._evaluate_and_update_metrics(
-            task_id,
-            cached_test_loader,
-            location_loaders=cached_location_loaders,
-            run_amca=True
-        )
+
+        # Final evaluation / AMCA update.
+        # If model stayed unchanged after the last epoch evaluation, reuse those
+        # metrics and only record AMCA to avoid a redundant full validation pass.
+        if not prune_applied and last_eval_snapshot is not None:
+            print(
+                f"\nFinal evaluation after task {task_id}: "
+                "reusing latest epoch metrics (no post-train model change)."
+            )
+            if self.use_amca and self.amca_tester:
+                try:
+                    per_class_acc = last_eval_snapshot.get('per_class_acc', {})
+                    overall_accuracy = float(last_eval_snapshot.get('overall_accuracy', 0.0))
+                    if per_class_acc:
+                        amca_results = self.amca_tester.record_from_per_class_dict(
+                            per_class_acc,
+                            overall_accuracy=overall_accuracy
+                        )
+                    else:
+                        amca_results = self.amca_tester.evaluate(self.model, cached_test_loader, device=self.device)
+                    print(
+                        f"MCA: {amca_results['mean_class_accuracy']:.4f}, "
+                        f"AMCA: {self.amca_tester.compute_amca():.4f}"
+                    )
+                except Exception as e:
+                    print(f"AMCA error: {e}")
+                    self.amca_tester.mean_class_accuracies.append(0.0)
+        else:
+            print(f"\nFinal evaluation after task {task_id}:")
+            self._evaluate_and_update_metrics(
+                task_id,
+                cached_test_loader,
+                location_ids=cached_location_ids,
+                run_amca=True
+            )
 
         # Record full task compute time (training + replay + final evaluation)
         task_elapsed_time = time.time() - task_start_time
@@ -1264,7 +1315,15 @@ class ContinualLearner:
         else:
             self._snapshot_last_good_model(task_id)
     
-    def _train_epoch(self, task_id: int, train_loader: DataLoader, epoch: int, collection_dict: Optional[Dict] = None):
+    def _train_epoch(
+        self,
+        task_id: int,
+        train_loader: DataLoader,
+        epoch: int,
+        collection_dict: Optional[Dict] = None,
+        task_progress_bar=None,
+        epoch_total: Optional[int] = None
+    ) -> tuple:
         """Train for one epoch with Batched Replay and Logit Capture."""
         from tqdm import tqdm
         
@@ -1275,30 +1334,74 @@ class ContinualLearner:
         total = 0
         
         training_config = self.config.get('training', {})
+        replay_config = self.config.get('replay_buffer', {})
         use_gradient_accumulation = training_config.get('use_gradient_accumulation', False)
-        accumulation_steps = training_config.get('accumulation_steps', 1) if use_gradient_accumulation else 1
+        accumulation_steps = max(1, int(training_config.get('accumulation_steps', 1))) if use_gradient_accumulation else 1
+        progress_update_interval = max(1, int(training_config.get('progress_update_interval', 10)))
         max_nonfinite_batches = max(
             1,
             int(training_config.get('max_nonfinite_batches_per_epoch', 5))
         )
+        use_cuda = (self.device == 'cuda')
+        replay_enabled = bool(replay_config.get('enabled', True))
+        replay_batch_size = max(1, int(replay_config.get('replay_batch_size', 32)))
+        replay_buffer_len = len(self.replay_buffer) if replay_enabled else 0
+        has_replay_data = replay_enabled and replay_buffer_len > 0
+        criterion = self.criterion
+        has_class_balanced_loss = criterion is not None
+        distill_temp = max(float(self.replay_buffer.distillation_temp), 1e-6)
+        train_loader_len = len(train_loader)
+        train_forward = self.train_model
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+
+        manage_local_pbar = (task_progress_bar is None)
+        if manage_local_pbar:
+            pbar = tqdm(
+                enumerate(train_loader),
+                total=train_loader_len,
+                desc=f"Epoch {epoch + 1}",
+                bar_format='{l_bar}{bar:30}{r_bar}{bar:-10b}'
+            )
+            batch_iterator = pbar
+        else:
+            pbar = task_progress_bar
+            batch_iterator = enumerate(train_loader)
+
+        num_output_classes = int(
+            getattr(
+                self.model.fc,
+                'out_features',
+                self.config.get('benchmark', {}).get('total_classes', 7)
+            )
+        )
+        if has_class_balanced_loss and hasattr(criterion, 'weights'):
+            weight_count = int(criterion.weights.numel())
+            if weight_count != num_output_classes:
+                raise RuntimeError(
+                    f"Class weight mismatch at task {task_id}: criterion has {weight_count} weights "
+                    f"but model outputs {num_output_classes} classes."
+                )
+
         nonfinite_batches = 0
         has_pending_grad = False
         
         self.optimizer.zero_grad(set_to_none=True)
         
-        pbar = tqdm(enumerate(train_loader), total=len(train_loader),
-                    desc=f"Epoch {epoch + 1}", 
-                    bar_format='{l_bar}{bar:30}{r_bar}{bar:-10b}')
-        
         collected_count = 0
-        samples_per_class_limit = self.config['replay_buffer'].get('samples_per_class', 200)
+        samples_per_class_limit = max(1, int(replay_config.get('samples_per_class', 200)))
         num_classes = int(self.config['benchmark'].get('total_classes', 7))
         collection_limit = samples_per_class_limit * num_classes
-        class_capture_counts = {class_id: 0 for class_id in range(num_classes)}
+        collection_enabled = collection_dict is not None and collection_limit > 0
+        class_capture_remaining = torch.full(
+            (num_classes,),
+            samples_per_class_limit,
+            device=self.device,
+            dtype=torch.long
+        )
 
-        for batch_idx, (images, labels) in pbar:
+        for batch_idx, (images, labels) in batch_iterator:
             try:
-                if self.device == 'cuda':
+                if use_cuda:
                     images = images.to(
                         self.device,
                         dtype=torch.float32,
@@ -1312,83 +1415,74 @@ class ContinualLearner:
                 
                 # Logic to capture logits for replay reuse
                 capture_indices = None
-                if collection_dict is not None and collected_count < collection_limit:
-                    selected_indices = []
-                    labels_cpu = labels.detach().cpu()
-                    unique_batch_labels = labels_cpu.unique(sorted=False)
+                if collection_enabled and collected_count < collection_limit:
+                    remaining_slots = int(collection_limit - collected_count)
+                    valid_mask = (labels >= 0) & (labels < num_classes)
+                    if bool(valid_mask.any().item()) and remaining_slots > 0:
+                        valid_positions = torch.nonzero(valid_mask, as_tuple=True)[0]
+                        valid_labels = labels.index_select(0, valid_positions)
+                        selected_chunks = []
 
-                    for class_tensor in unique_batch_labels:
-                        class_id = int(class_tensor.item())
-                        if class_id < 0:
-                            continue
-                        if class_id not in class_capture_counts:
-                            continue
+                        for class_tensor in valid_labels.unique(sorted=False):
+                            class_id = int(class_tensor.item())
+                            remaining_for_class = int(class_capture_remaining[class_id].item())
+                            if remaining_for_class <= 0:
+                                continue
 
-                        remaining_for_class = samples_per_class_limit - class_capture_counts[class_id]
-                        if remaining_for_class <= 0:
-                            continue
+                            class_positions = valid_positions[valid_labels == class_tensor]
+                            if class_positions.numel() == 0:
+                                continue
 
-                        class_positions = torch.nonzero(labels_cpu == class_id, as_tuple=True)[0]
-                        if class_positions.numel() == 0:
-                            continue
+                            take_count = min(
+                                int(class_positions.numel()),
+                                remaining_for_class,
+                                remaining_slots
+                            )
+                            if take_count <= 0:
+                                continue
 
-                        take_count = min(int(class_positions.numel()), int(remaining_for_class))
-                        selected_indices.append(class_positions[:take_count])
+                            selected_chunks.append(class_positions[:take_count])
+                            remaining_slots -= take_count
+                            if remaining_slots <= 0:
+                                break
 
-                    if selected_indices:
-                        capture_indices = torch.cat(selected_indices, dim=0)
+                        if selected_chunks:
+                            capture_indices = torch.cat(selected_chunks, dim=0)
 
                 with torch.amp.autocast('cuda', enabled=self.use_amp):
-                    outputs = self.train_model(images)
+                    outputs = train_forward(images)
                 
                 if capture_indices is not None and capture_indices.numel() > 0:
-                    selected_images = images.index_select(0, capture_indices.to(images.device)).detach().cpu()
-                    selected_labels = labels.index_select(0, capture_indices.to(labels.device)).detach().cpu()
-                    selected_logits = outputs.index_select(0, capture_indices.to(outputs.device)).detach().cpu()
+                    selected_images = images.index_select(0, capture_indices).detach().cpu()
+                    selected_labels = labels.index_select(0, capture_indices)
+                    selected_logits = outputs.index_select(0, capture_indices).detach().cpu()
+                    selected_labels_cpu = selected_labels.detach().cpu()
 
                     collection_dict['images'].append(selected_images)
-                    collection_dict['labels'].append(selected_labels)
+                    collection_dict['labels'].append(selected_labels_cpu)
                     collection_dict['logits'].append(selected_logits)
 
-                    for selected_label in selected_labels.tolist():
-                        label_int = int(selected_label)
-                        if label_int in class_capture_counts:
-                            class_capture_counts[label_int] += 1
+                    if num_classes > 0:
+                        captured_counts = torch.bincount(selected_labels, minlength=num_classes)
+                        class_capture_remaining.sub_(captured_counts[:num_classes])
+                        class_capture_remaining.clamp_(min=0)
 
-                    collected_count += int(selected_labels.numel())
+                    collected_count += int(selected_labels.size(0))
 
                 outputs_float = outputs.float()
 
-                num_output_classes = int(outputs_float.size(1))
-                if self.criterion is not None and hasattr(self.criterion, 'weights'):
-                    weight_count = int(self.criterion.weights.numel())
-                    if weight_count != num_output_classes:
-                        raise RuntimeError(
-                            f"Class weight mismatch at task {task_id}: criterion has {weight_count} weights "
-                            f"but model outputs {num_output_classes} classes."
-                        )
-                if labels.numel() > 0:
-                    max_label_in_batch = int(labels.max().item())
-                    if max_label_in_batch >= num_output_classes:
-                        raise RuntimeError(
-                            f"Label out of range at task {task_id}: max label {max_label_in_batch}, "
-                            f"but model outputs {num_output_classes} classes."
-                        )
-                
-                if self.criterion is not None:
-                    loss = self.criterion(outputs_float, labels)
+                if has_class_balanced_loss:
+                    loss = criterion(outputs_float, labels)
                 else:
                     loss = F.cross_entropy(outputs_float, labels)
             
-                replay_enabled = self.config.get('replay_buffer', {}).get('enabled', True)
-                if replay_enabled and len(self.replay_buffer) > 0:
-                    replay_batch_size = self.config['replay_buffer'].get('replay_batch_size', 32)
+                if has_replay_data:
                     replay_batch = self.replay_buffer.get_batch(
-                        batch_size=min(replay_batch_size, len(self.replay_buffer))
+                        batch_size=min(replay_batch_size, replay_buffer_len)
                     )
                     
                     if replay_batch is not None:
-                        if self.device == 'cuda':
+                        if use_cuda:
                             r_imgs = replay_batch['images'].to(
                                 self.device,
                                 dtype=torch.float32,
@@ -1405,10 +1499,10 @@ class ContinualLearner:
                         r_lbls = replay_batch['labels'].to(self.device, non_blocking=True)
                         
                         with torch.amp.autocast('cuda', enabled=self.use_amp):
-                            r_out = self.train_model(r_imgs)
+                            r_out = train_forward(r_imgs)
 
-                        if self.criterion is not None:
-                            loss += 0.5 * self.criterion(r_out.float(), r_lbls)
+                        if has_class_balanced_loss:
+                            loss += 0.5 * criterion(r_out.float(), r_lbls)
                         else:
                             loss += 0.5 * F.cross_entropy(r_out.float(), r_lbls)
                         
@@ -1421,11 +1515,10 @@ class ContinualLearner:
                                 r_out_dist = r_out
                             else:
                                 with torch.amp.autocast('cuda', enabled=self.use_amp):
-                                    r_out_dist = self.train_model(r_imgs)
+                                    r_out_dist = train_forward(r_imgs)
 
-                            temp = max(float(self.replay_buffer.distillation_temp), 1e-6)
-                            log_probs = F.log_softmax(r_out_dist.float() / temp, dim=1)
-                            loss += 0.3 * (temp ** 2) * F.kl_div(log_probs, soft_targets, reduction='batchmean')
+                            log_probs = F.log_softmax(r_out_dist.float() / distill_temp, dim=1)
+                            loss += 0.3 * (distill_temp ** 2) * F.kl_div(log_probs, soft_targets, reduction='batchmean')
 
                 if not torch.isfinite(loss).all():
                     nonfinite_batches += 1
@@ -1449,7 +1542,7 @@ class ContinualLearner:
                 if (batch_idx + 1) % accumulation_steps == 0:
                     if has_pending_grad:
                         self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                         self.optimizer.zero_grad(set_to_none=True)
@@ -1471,15 +1564,27 @@ class ContinualLearner:
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
             
-            pbar.set_postfix({'loss': f'{total_loss/(batch_idx+1):.4f}', 'acc': f'{100.*correct/total:.2f}%'})
+            if total > 0 and (
+                (batch_idx + 1) % progress_update_interval == 0
+                or (batch_idx + 1) == train_loader_len
+            ):
+                if manage_local_pbar:
+                    pbar.set_postfix({'loss': f'{total_loss/(batch_idx+1):.4f}', 'acc': f'{100.*correct/total:.2f}%'})
         
-        if (batch_idx + 1) % accumulation_steps != 0 and has_pending_grad:
+        if has_pending_grad:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
 
         if hasattr(self, 'scheduler'):
             self.scheduler.step()
+
+        if manage_local_pbar:
+            pbar.close()
+
+        epoch_avg_loss = float(total_loss / max(1, train_loader_len))
+        epoch_acc = float(100.0 * correct / max(1, total))
+        return epoch_avg_loss, epoch_acc
 
     def _update_replay_buffer_from_memory(self, task_id: int, collected_data: Dict):
         """Optimized update using pre-computed logits."""
@@ -1662,6 +1767,8 @@ class ContinualLearner:
                 for adapter_idx, adapter in enumerate(adapters):
                     adapter_id = id(adapter)
                     is_new_adapter = adapter_id in self.current_task_new_adapter_ids
+                    if self.protect_current_task_adapters and is_new_adapter:
+                        continue
                     if self.pruning_scope == 'older_adapters_only' and is_new_adapter:
                         continue
 
@@ -1826,7 +1933,7 @@ class ContinualLearner:
             print(f"No active dense parameters available to prune at task {task_id}")
             return False
 
-        prune_amount = self._resolve_budget_driven_prune_amount(
+        prune_amount = self._resolve_prune_amount(
             prunable_effective_params=prunable_effective,
             task_id=task_id
         )
@@ -1984,16 +2091,14 @@ class ContinualLearner:
             original_scope = self.pruning_scope
             original_method = self.pruning_method
             original_amount = self.pruning_amount
-            original_budget_driven = self.pruning_budget_driven
 
             whole_model_success = False
             adapter_success = False
             try:
-                # Step 1: Gentle global squeeze to counter cumulative expansion.
+                # Step 1: Very gentle base compression.
                 self.pruning_scope = 'whole_model'
                 self.pruning_method = 'structural'
-                self.pruning_budget_driven = False
-                self.pruning_amount = 0.015
+                self.pruning_amount = self.hybrid_whole_model_amount
                 whole_model_success = self._auto_structural_prune_whole_model(
                     task_id=task_id,
                     train_loader=train_loader
@@ -2002,9 +2107,10 @@ class ContinualLearner:
                 expected_num_classes = int(self.config.get('benchmark', {}).get('total_classes', 7))
                 self._ensure_classifier_head(expected_num_classes)
 
-                # Step 2: Aggressive cleanup of stale historical adapters.
-                self.pruning_scope = 'older_adapters_only'
-                self.pruning_amount = 0.30
+                # Step 2: Adapter cleanup always runs after gentle whole-model compression.
+                self.pruning_scope = self.hybrid_adapter_scope
+                self.pruning_method = original_method
+                self.pruning_amount = self.hybrid_adapter_amount
                 adapter_success = self._auto_prune_network_end_of_task(
                     task_id=task_id,
                     train_loader=train_loader
@@ -2013,7 +2119,6 @@ class ContinualLearner:
                 self.pruning_scope = original_scope
                 self.pruning_method = original_method
                 self.pruning_amount = original_amount
-                self.pruning_budget_driven = original_budget_driven
 
             return bool(whole_model_success or adapter_success)
 
@@ -2037,7 +2142,7 @@ class ContinualLearner:
                 print(f"No active dense parameters available to prune at task {task_id}")
                 return False
 
-            prune_amount = self._resolve_budget_driven_prune_amount(
+            prune_amount = self._resolve_prune_amount(
                 prunable_effective_params=prunable_effective,
                 task_id=task_id
             )
@@ -2106,14 +2211,17 @@ class ContinualLearner:
 
         adapter_grad_state = []
         try:
-            if self.pruning_importance == 'taylor' and self.pruning_scope == 'older_adapters_only':
+            if self.pruning_importance == 'taylor' and self.pruning_scope in {'older_adapters_only', 'all_adapters'}:
                 print("Populating Replay gradients to evaluate Adapter AMCA utility...")
 
                 # Adapter pruning happens after training where historical adapters are
                 # often frozen. Temporarily enable grads so Taylor can score them.
                 for _, _, adapter in self._iter_adapters():
                     is_new_adapter = id(adapter) in self.current_task_new_adapter_ids
-                    if self.pruning_scope == 'older_adapters_only' and is_new_adapter:
+                    if is_new_adapter and (
+                        self.protect_current_task_adapters
+                        or self.pruning_scope == 'older_adapters_only'
+                    ):
                         continue
                     for p in adapter.parameters():
                         adapter_grad_state.append((p, bool(p.requires_grad)))
@@ -2140,7 +2248,7 @@ class ContinualLearner:
                 print(f"No removable adapter parameters available at task {task_id}")
                 return False
 
-            prune_amount = self._resolve_budget_driven_prune_amount(
+            prune_amount = self._resolve_prune_amount(
                 prunable_effective_params=total_candidate_params,
                 task_id=task_id
             )
@@ -2197,10 +2305,8 @@ class ContinualLearner:
                 pruned_now = max(0, before_effective - after_effective)
 
                 # Keep tracking set aligned after structural deletions.
-                self.current_task_new_adapter_ids = {
-                    adapter_id for adapter_id in self.current_task_new_adapter_ids
-                    if any(id(adapter) == adapter_id for _, _, adapter in self._iter_adapters())
-                }
+                alive_adapter_ids = {id(adapter) for _, _, adapter in self._iter_adapters()}
+                self.current_task_new_adapter_ids &= alive_adapter_ids
 
                 self.pruning_history.append({
                     'task_id': int(task_id),
@@ -2251,70 +2357,83 @@ class ContinualLearner:
 
         return None
 
-    def _build_location_loaders(self, combined_test_dataset, batch_size: int, num_workers: int, pin_memory: bool):
-        """Create per-location dataloaders from the same official validation split."""
-        location_indices = {
-            'Citystreet': [],
-            'Countryroad': [],
-            'Highway': []
+    def _build_location_id_tensor(self, combined_test_dataset) -> torch.Tensor:
+        """Create a dense location-id tensor aligned with test-dataset order."""
+        location_to_id = {
+            'Citystreet': 0,
+            'Countryroad': 1,
+            'Highway': 2
         }
 
+        location_ids = torch.full((len(combined_test_dataset),), -1, dtype=torch.long)
         for idx in range(len(combined_test_dataset)):
             location = self._resolve_location_for_dataset_index(combined_test_dataset, idx)
-            if location in location_indices:
-                location_indices[location].append(idx)
+            mapped_id = location_to_id.get(location, -1)
+            location_ids[idx] = int(mapped_id)
 
-        location_loaders = {}
-        for location, indices in location_indices.items():
-            if not indices:
-                continue
-            subset = Subset(combined_test_dataset, indices)
-            location_loaders[location] = DataLoader(
-                subset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                prefetch_factor=2 if num_workers > 0 else None,
-                persistent_workers=True if num_workers > 0 else False
-            )
-        return location_loaders
+        return location_ids
 
     def _evaluate_and_update_metrics(
         self,
         task_id: int,
         test_loader: DataLoader,
-        location_loaders: Optional[Dict[str, DataLoader]] = None,
+        location_ids: Optional[torch.Tensor] = None,
         run_amca: bool = True
     ):
         # Uses persistent loader
-        if test_loader is None: return
+        if test_loader is None:
+            return None
+
+        overall_accuracy = 0.0
+        per_class_acc = {}
 
         try:
-            # Standard Evaluation
-            overall_accuracy, per_class_acc = evaluate_model(
-                self.model, test_loader, task_id=task_id, device=self.device, return_per_class=True
-            )
-            self.metrics.update_accuracy(task_id, overall_accuracy, per_class_acc)
+            location_names = ['Citystreet', 'Countryroad', 'Highway']
+            if location_ids is not None and torch.is_tensor(location_ids) and location_ids.numel() > 0:
+                eval_results = evaluate_model_with_locations(
+                    self.model,
+                    test_loader,
+                    task_id=task_id,
+                    device=self.device,
+                    location_ids=location_ids,
+                    location_names=location_names
+                )
+                overall_accuracy = float(eval_results.get('accuracy', 0.0))
+                per_class_acc = eval_results.get('per_class_acc', {}) or {}
+                self.metrics.update_accuracy(task_id, overall_accuracy, per_class_acc)
 
-            # Per-location evaluation (validation split, grouped by location)
-            if location_loaders:
-                for location, loader in location_loaders.items():
-                    loc_acc, loc_per_class = evaluate_model(
-                        self.model, loader, task_id=task_id, device=self.device, return_per_class=True
-                    )
+                location_acc = eval_results.get('location_accuracy', {}) or {}
+                location_per_class = eval_results.get('location_per_class_acc', {}) or {}
+                for location, loc_acc in location_acc.items():
                     self.metrics.update_location_accuracy(
                         task_id=task_id,
                         location=location,
-                        accuracy=loc_acc,
-                        class_accuracies=loc_per_class
+                        accuracy=float(loc_acc),
+                        class_accuracies=location_per_class.get(location, {})
                     )
+            else:
+                overall_accuracy, per_class_acc = evaluate_model(
+                    self.model,
+                    test_loader,
+                    task_id=task_id,
+                    device=self.device,
+                    return_per_class=True
+                )
+                self.metrics.update_accuracy(task_id, overall_accuracy, per_class_acc)
             
             # AMCA Logic
             if self.use_amca and self.amca_tester:
                 if run_amca:
                     try:
-                        amca_results = self.amca_tester.evaluate(self.model, test_loader, device=self.device)
+                        # Reuse per-class results from standard evaluation to avoid
+                        # a redundant second full forward pass over the test loader.
+                        if per_class_acc:
+                            amca_results = self.amca_tester.record_from_per_class_dict(
+                                per_class_acc,
+                                overall_accuracy=overall_accuracy
+                            )
+                        else:
+                            amca_results = self.amca_tester.evaluate(self.model, test_loader, device=self.device)
                         print(f"MCA: {amca_results['mean_class_accuracy']:.4f}, AMCA: {self.amca_tester.compute_amca():.4f}")
                     except Exception as e:
                         print(f"AMCA error: {e}")
@@ -2327,12 +2446,17 @@ class ContinualLearner:
                         print("MCA: N/A")
         except Exception as e:
             print(f"[ERROR] Evaluation failed: {e}")
+            return None
         
         model_stats = compute_model_size(self.model)
         buffer_memory = self.replay_buffer.get_memory_size()
         self.metrics.update_memory(model_stats['total_mb'] + buffer_memory)
 
         self.metrics.update_num_parameters(self._get_effective_model_params())
+        return {
+            'overall_accuracy': float(overall_accuracy),
+            'per_class_acc': per_class_acc
+        }
     def _estimate_expand_layer_params_delta(self, layer_name: str) -> int:
         """
         Estimate parameter increase for one expand_layer action.
@@ -2359,20 +2483,6 @@ class ContinualLearner:
                 delta += (in_channels * hidden) + (hidden * in_channels)
 
         return int(delta)
-
-    def _get_num_classes(self, dataloader: DataLoader) -> int:
-        configured = int(self.config.get('benchmark', {}).get('total_classes', 0))
-        if configured > 0:
-            return configured
-
-        max_label = -1
-        for _, batch_labels in dataloader:
-            if torch.is_tensor(batch_labels) and batch_labels.numel() > 0:
-                max_label = max(max_label, int(batch_labels.max().item()))
-            if max_label >= 100:
-                break
-
-        return max_label + 1 if max_label >= 0 else 1
 
     def save_checkpoint(self, path: str, task_id: int):
         os.makedirs(os.path.dirname(path), exist_ok=True)

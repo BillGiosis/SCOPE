@@ -77,7 +77,6 @@ def main(args):
     pruning_cfg = config.get('network_pruning', {})
     
     print(f"Configuration loaded from {args.config}")
-    print(f"Backbone: resnet50d")
     print(f"Network Expansion Strategy: {expansion_strategy}")
     print(f"Network Pruning Enabled: {pruning_cfg.get('enabled', False)}")
     print(f"Device: {args.device}")
@@ -92,7 +91,7 @@ def main(args):
     benchmark = create_cladc_benchmark(config)
     
     # Create model
-    print("\nCreating expandable ResNet model")
+    print("\nCreating expandable model")
     # Model needs 7 outputs (indices 0-6) since labels are category_id 1-6
     num_classes = config['benchmark']['total_classes']
     model = create_expandable_resnet(
@@ -143,7 +142,7 @@ def main(args):
     validation_cfg = pruning_cfg.get('validation', {})
     efficiency_metrics = None
     if validation_cfg.get('report_efficiency_metrics', True):
-        fallback_shape = tuple(pruning_cfg.get('example_input_shape', [1, 3, 224, 224]))
+        fallback_shape = (1, 3, 64, 64)
         input_shape = infer_input_shape_from_loaders(last_test_loaders, fallback=fallback_shape)
         warmup_runs = int(validation_cfg.get('latency_warmup_runs', 5))
         latency_runs = int(validation_cfg.get('latency_runs', 20))
@@ -213,7 +212,6 @@ def main(args):
         f.write(f"  Learning Rate: {config['training']['learning_rate']}\n")
         f.write(f"  Optimizer: {config['training']['optimizer']}\n")
         f.write(f"  Weight Decay: {config['training']['weight_decay']}\n")
-        f.write(f"  Eval Frequency: {config['training']['eval_frequency']}\n")
         f.write(f"  AMP: {config['training'].get('use_amp', False)}\n")
         f.write(f"  Gradient Accumulation: {config['training'].get('use_gradient_accumulation', False)}\n")
         f.write(f"  Accumulation Steps: {config['training'].get('accumulation_steps', 1)}\n")
@@ -223,7 +221,6 @@ def main(args):
         f.write(f"Replay Buffer:\n")
         f.write(f"  Replay Buffer Enabled: {config['replay_buffer'].get('enabled', True)}\n")
         f.write(f"  Max Size: {config['replay_buffer']['max_size']}\n")
-        f.write("  Capacity Policy: fixed at max_size\n")
         f.write(f"  Distillation Temp: {config['replay_buffer']['distillation_temp']}\n")
         f.write(f"  Replay Batch Size: {config['replay_buffer']['replay_batch_size']}\n\n")
         
@@ -246,7 +243,6 @@ def main(args):
         f.write(f"  Amount (max per task): {pruning_cfg.get('amount', 0.0)}\n")
         f.write(f"  Warmup Tasks: {pruning_cfg.get('warmup_tasks', 2)}\n")
         f.write(f"  Pruning Interval Tasks: {pruning_cfg.get('interval_tasks', 1)}\n")
-        f.write(f"  Budget Driven: {pruning_cfg.get('budget_driven', True)}\n")
         f.write(f"  Min Amount: {pruning_cfg.get('min_amount', 0.0)}\n")
         f.write(f"  Max Amount: {pruning_cfg.get('max_amount', pruning_cfg.get('amount', 0.0))}\n")
         f.write(f"  Scope: {pruning_cfg.get('scope', 'whole_model')}\n")
@@ -258,7 +254,6 @@ def main(args):
         f.write(f"  Taylor Replay Batch Size: {pruning_cfg.get('taylor_replay_batch_size', config['replay_buffer'].get('replay_batch_size', 32))}\n")
         f.write(f"  Rebuild Optimizer After Prune: {pruning_cfg.get('rebuild_optimizer_after_prune', True)}\n")
         f.write(f"  Recompile After Prune: {pruning_cfg.get('recompile_after_prune', True)}\n")
-        f.write(f"  Example Input Shape: {pruning_cfg.get('example_input_shape', [1, 3, 224, 224])}\n")
         f.write(f"  Protect Current-Task Adapters: {pruning_cfg.get('protect_current_task_adapters', True)}\n")
         f.write(f"  Protect Classifier: {pruning_cfg.get('protect_classifier', True)}\n")
         f.write(f"  Protect Downsample: {pruning_cfg.get('protect_downsample', True)}\n")
