@@ -1,0 +1,74 @@
+# BDD-C Benchmark Configuration
+benchmark:
+  name: "BDD-C"
+  data_root: "/workspace/data/BDD-C"
+  eval_split: "val"
+  num_tasks: 5
+
+  max_params_ratio: 1.15
+
+training:
+  batch_size: 64
+  epochs_per_task: 10
+  learning_rate: 0.0001
+  optimizer: "adamw"
+  weight_decay: 0.01
+  use_amp: true
+
+  cb_beta: 0.9999
+
+replay_buffer:
+  enabled: true
+  max_size: 10000
+  distillation_temp: 1.5
+  replay_batch_size: 32
+  auto_distill_end_of_task: true
+  end_of_task_distill_compression_ratio: 0.90
+
+data_loading:
+  num_workers: 24
+  pin_memory: true
+  prefetch_factor: 4
+
+network_expansion:
+  enabled: true
+  strategy: "layer2_layer3_split"
+
+network_pruning:
+  enabled: true
+  amount: 0.05
+  warmup_tasks: 1
+  interval_tasks: 1
+  min_amount: 0.02
+  max_amount: 0.15
+  scope: "hybrid"
+  method: "structural"
+  hybrid:
+    whole_model_amount: 0.01
+    adapter_amount: 0.30
+    adapter_scope: "older_adapters_only"
+  importance: "taylor"
+  use_replay_for_taylor: true
+  taylor_replay_batches: 8
+  taylor_train_batches: 2
+  taylor_replay_batch_size: 32
+  rebuild_optimizer_after_prune: true
+  recompile_after_prune: true
+  protect_current_task_adapters: true
+  protect_classifier: true
+  protect_downsample: true
+  rollback:
+    enabled: true
+    max_mca_drop: 0.015
+    eval_max_batches: 15
+  recovery:
+    enabled: true
+    epochs: 2
+    learning_rate_scale: 0.2
+  validation:
+    report_efficiency_metrics: true
+    latency_warmup_runs: 5
+    latency_runs: 10
+
+logging:
+  save_dir: "./checkpoints/bddc"

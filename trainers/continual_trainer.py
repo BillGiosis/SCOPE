@@ -24,6 +24,7 @@ from utils.metrics import (
     MetricsTracker,
     AMCATester,
     evaluate_model,
+    evaluate_model_with_groups,
     evaluate_model_with_locations,
     compute_model_size
 )
@@ -85,6 +86,7 @@ class ContinualLearner:
         self.metrics = MetricsTracker(
             num_tasks=config['benchmark']['num_tasks']
         )
+        self.metric_groups = self._resolve_metric_groups(config.get('benchmark', {}).get('metric_groups', {}))
         
         # Initialize AMCA tester for CLAD-C
         if use_amca:
@@ -219,6 +221,7 @@ class ContinualLearner:
         self.last_good_task_id: Optional[int] = None
         self._cached_eval_loaders: Dict[int, DataLoader] = {}
         self._cached_location_ids: Dict[int, torch.Tensor] = {}
+        self._cached_group_ids: Dict[int, Dict[str, torch.Tensor]] = {}
 
     def _is_pruning_task(self, task_id: int) -> bool:
         """Return whether pruning should run for this task id under warmup/interval rules."""
@@ -1152,6 +1155,7 @@ class ContinualLearner:
         
         cached_test_loader = None
         cached_location_ids = None
+        cached_group_ids = {}
         if all_test_datasets:
             if len(all_test_datasets) == 1:
                 combined_test_dataset = all_test_datasets[0]
@@ -1179,6 +1183,17 @@ class ContinualLearner:
                     combined_test_dataset=combined_test_dataset
                 )
             cached_location_ids = self._cached_location_ids[cache_key]
+
+            if cache_key not in self._cached_group_ids:
+                self._cached_group_ids[cache_key] = {}
+            for group_name, group_names in self.metric_groups.items():
+                if group_name not in self._cached_group_ids[cache_key]:
+                    self._cached_group_ids[cache_key][group_name] = self._build_group_id_tensor(
+                        combined_test_dataset=combined_test_dataset,
+                        group_name=group_name,
+                        group_names=group_names
+                    )
+                cached_group_ids[group_name] = self._cached_group_ids[cache_key][group_name]
 
         # --- Training Loop ---
         replay_candidates = {'images': [], 'labels': [], 'logits': []} # Logits added for re-use
@@ -1221,7 +1236,7 @@ class ContinualLearner:
                     last_eval_snapshot = self._evaluate_and_update_metrics(
                         task_id,
                         cached_test_loader,
-                        location_ids=cached_location_ids,
+                        group_id_tensors=cached_group_ids or ({'location': cached_location_ids} if cached_location_ids is not None else {}),
                         run_amca=False
                     )
         finally:
@@ -1293,7 +1308,7 @@ class ContinualLearner:
             self._evaluate_and_update_metrics(
                 task_id,
                 cached_test_loader,
-                location_ids=cached_location_ids,
+                group_id_tensors=cached_group_ids or ({'location': cached_location_ids} if cached_location_ids is not None else {}),
                 run_amca=True
             )
 
@@ -1388,9 +1403,24 @@ class ContinualLearner:
         self.optimizer.zero_grad(set_to_none=True)
         
         collected_count = 0
-        samples_per_class_limit = max(1, int(replay_config.get('samples_per_class', 200)))
         num_classes = int(self.config['benchmark'].get('total_classes', 7))
-        collection_limit = samples_per_class_limit * num_classes
+        benchmark_name = str(self.config.get('benchmark', {}).get('name', '')).strip().lower()
+        buffer_max_size = int(getattr(self.replay_buffer, 'max_size', replay_config.get('max_size', 1000)))
+        auto_collection_multiplier = float(replay_config.get('collection_multiplier', 1.5))
+        auto_collection_limit = max(
+            buffer_max_size,
+            int(round(buffer_max_size * max(1.0, auto_collection_multiplier)))
+        )
+        explicit_samples_per_class = replay_config.get('samples_per_class', None)
+        if explicit_samples_per_class is not None:
+            samples_per_class_limit = max(1, int(explicit_samples_per_class))
+            collection_limit = samples_per_class_limit * num_classes
+        elif benchmark_name == 'bdd-c':
+            collection_limit = auto_collection_limit
+            samples_per_class_limit = max(1, (collection_limit + max(1, num_classes) - 1) // max(1, num_classes))
+        else:
+            samples_per_class_limit = 200
+            collection_limit = samples_per_class_limit * num_classes
         collection_enabled = collection_dict is not None and collection_limit > 0
         class_capture_remaining = torch.full(
             (num_classes,),
@@ -2357,6 +2387,61 @@ class ContinualLearner:
 
         return None
 
+    @staticmethod
+    def _resolve_metric_groups(metric_groups_cfg: Dict) -> Dict[str, List[str]]:
+        """Normalize benchmark metric-group config to {group_name: [display values]}."""
+        resolved = {}
+        for group_name, group_cfg in (metric_groups_cfg or {}).items():
+            names = []
+            if isinstance(group_cfg, dict):
+                names = group_cfg.get('names', []) or []
+            elif isinstance(group_cfg, list):
+                names = group_cfg
+            if names:
+                resolved[str(group_name)] = [str(name) for name in names]
+        if not resolved:
+            resolved['location'] = ['Citystreet', 'Countryroad', 'Highway']
+        return resolved
+
+    def _resolve_group_value_for_dataset_index(self, dataset, idx: int, group_name: str):
+        """Resolve a configured group value from wrapped/concat/subset datasets."""
+        if hasattr(dataset, 'get_group_value'):
+            return dataset.get_group_value(idx, group_name)
+
+        if group_name == 'location' and hasattr(dataset, 'get_location'):
+            return dataset.get_location(idx)
+
+        if hasattr(dataset, 'dataset') and hasattr(dataset, 'indices'):
+            parent_idx = dataset.indices[idx]
+            return self._resolve_group_value_for_dataset_index(dataset.dataset, parent_idx, group_name)
+
+        if hasattr(dataset, 'datasets'):
+            sample_idx = idx
+            for d in dataset.datasets:
+                if sample_idx < len(d):
+                    return self._resolve_group_value_for_dataset_index(d, sample_idx, group_name)
+                sample_idx -= len(d)
+
+        return None
+
+    def _build_group_id_tensor(
+        self,
+        combined_test_dataset,
+        group_name: str,
+        group_names: List[str]
+    ) -> torch.Tensor:
+        """Create a dense group-id tensor aligned with dataset order."""
+        group_to_id = {name: idx for idx, name in enumerate(group_names)}
+        group_ids = torch.full((len(combined_test_dataset),), -1, dtype=torch.long)
+        for idx in range(len(combined_test_dataset)):
+            group_value = self._resolve_group_value_for_dataset_index(
+                combined_test_dataset,
+                idx,
+                group_name
+            )
+            group_ids[idx] = int(group_to_id.get(group_value, -1))
+        return group_ids
+
     def _build_location_id_tensor(self, combined_test_dataset) -> torch.Tensor:
         """Create a dense location-id tensor aligned with test-dataset order."""
         location_to_id = {
@@ -2377,7 +2462,7 @@ class ContinualLearner:
         self,
         task_id: int,
         test_loader: DataLoader,
-        location_ids: Optional[torch.Tensor] = None,
+        group_id_tensors: Optional[Dict[str, torch.Tensor]] = None,
         run_amca: bool = True
     ):
         # Uses persistent loader
@@ -2388,29 +2473,31 @@ class ContinualLearner:
         per_class_acc = {}
 
         try:
-            location_names = ['Citystreet', 'Countryroad', 'Highway']
-            if location_ids is not None and torch.is_tensor(location_ids) and location_ids.numel() > 0:
-                eval_results = evaluate_model_with_locations(
+            if group_id_tensors:
+                eval_results = evaluate_model_with_groups(
                     self.model,
                     test_loader,
                     task_id=task_id,
                     device=self.device,
-                    location_ids=location_ids,
-                    location_names=location_names
+                    group_id_tensors=group_id_tensors,
+                    group_names=self.metric_groups
                 )
                 overall_accuracy = float(eval_results.get('accuracy', 0.0))
                 per_class_acc = eval_results.get('per_class_acc', {}) or {}
                 self.metrics.update_accuracy(task_id, overall_accuracy, per_class_acc)
 
-                location_acc = eval_results.get('location_accuracy', {}) or {}
-                location_per_class = eval_results.get('location_per_class_acc', {}) or {}
-                for location, loc_acc in location_acc.items():
-                    self.metrics.update_location_accuracy(
-                        task_id=task_id,
-                        location=location,
-                        accuracy=float(loc_acc),
-                        class_accuracies=location_per_class.get(location, {})
-                    )
+                grouped_acc = eval_results.get('group_accuracy', {}) or {}
+                grouped_per_class = eval_results.get('group_per_class_acc', {}) or {}
+                for group_name, group_values in grouped_acc.items():
+                    per_class_by_value = grouped_per_class.get(group_name, {}) or {}
+                    for group_value, value_acc in group_values.items():
+                        self.metrics.update_group_accuracy(
+                            group_name=group_name,
+                            group_value=group_value,
+                            task_id=task_id,
+                            accuracy=float(value_acc),
+                            class_accuracies=per_class_by_value.get(group_value, {})
+                        )
             else:
                 overall_accuracy, per_class_acc = evaluate_model(
                     self.model,

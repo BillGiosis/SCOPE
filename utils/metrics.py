@@ -37,7 +37,7 @@ class AMCATester:
         model.eval()
         use_cuda = str(device).startswith('cuda')
         
-        max_cls = self.num_classes + 1
+        max_cls = max(self.num_classes, self.num_classes + 1)
         class_correct_tensor = torch.zeros(max_cls, device=device, dtype=torch.long)
         class_total_tensor = torch.zeros(max_cls, device=device, dtype=torch.long)
 
@@ -181,13 +181,19 @@ class MetricsTracker:
 
         # Per-location tracking:
         # task_id -> {location: overall_accuracy}
-        self.task_location_accuracies = defaultdict(dict)
+        self.task_group_accuracies = defaultdict(lambda: defaultdict(dict))
         # task_id -> {location: {class_id: accuracy}}
-        self.task_location_class_accuracies = defaultdict(dict)
+        self.task_group_class_accuracies = defaultdict(lambda: defaultdict(dict))
         # location -> [mca over evaluation points]
-        self.location_mca_history = defaultdict(list)
+        self.group_mca_history = defaultdict(lambda: defaultdict(list))
         # location -> [overall accuracy over evaluation points]
-        self.location_overall_history = defaultdict(list)
+        self.group_overall_history = defaultdict(lambda: defaultdict(list))
+
+        # Backward-compatible location aliases for CLAD-C code paths.
+        self.task_location_accuracies = self.task_group_accuracies['location']
+        self.task_location_class_accuracies = self.task_group_class_accuracies['location']
+        self.location_mca_history = self.group_mca_history['location']
+        self.location_overall_history = self.group_overall_history['location']
         
         # Best accuracy achieved for each task
         self.best_task_accuracies = {}
@@ -216,6 +222,28 @@ class MetricsTracker:
                 self.best_task_accuracies[task_id], accuracy
             )
 
+    def update_group_accuracy(
+        self,
+        group_name: str,
+        group_value: str,
+        task_id: int,
+        accuracy: float,
+        class_accuracies: Optional[Dict[int, float]] = None
+    ):
+        """Record grouped overall and per-class accuracy."""
+        self.task_group_accuracies[group_name][task_id][group_value] = accuracy
+
+        if class_accuracies is None:
+            class_accuracies = {}
+        self.task_group_class_accuracies[group_name][task_id][group_value] = class_accuracies
+
+        if class_accuracies:
+            mca = float(np.mean(list(class_accuracies.values())))
+        else:
+            mca = 0.0
+        self.group_mca_history[group_name][group_value].append(mca)
+        self.group_overall_history[group_name][group_value].append(float(accuracy))
+
     def update_location_accuracy(
         self,
         task_id: int,
@@ -224,18 +252,13 @@ class MetricsTracker:
         class_accuracies: Optional[Dict[int, float]] = None
     ):
         """Record location-wise overall and per-class accuracy."""
-        self.task_location_accuracies[task_id][location] = accuracy
-
-        if class_accuracies is None:
-            class_accuracies = {}
-        self.task_location_class_accuracies[task_id][location] = class_accuracies
-
-        if class_accuracies:
-            mca = float(np.mean(list(class_accuracies.values())))
-        else:
-            mca = 0.0
-        self.location_mca_history[location].append(mca)
-        self.location_overall_history[location].append(float(accuracy))
+        self.update_group_accuracy(
+            group_name='location',
+            group_value=location,
+            task_id=task_id,
+            accuracy=accuracy,
+            class_accuracies=class_accuracies
+        )
     
     def update_memory(self, memory_mb: float):
         """Record memory usage."""
@@ -335,8 +358,7 @@ def evaluate_model(
     model.eval()
     use_cuda = str(device).startswith('cuda')
     
-    # Initialize tensors on GPU
-    max_cls = 20 
+    max_cls = max(20, int(getattr(getattr(model, 'fc', None), 'out_features', 20)))
     total_class_counts = torch.zeros(max_cls, device=device, dtype=torch.long)
     correct_class_counts = torch.zeros(max_cls, device=device, dtype=torch.long)
     
@@ -408,51 +430,45 @@ def evaluate_model(
     return accuracy
 
 
-def evaluate_model_with_locations(
+def evaluate_model_with_groups(
     model: nn.Module,
     dataloader,
     task_id: int,
     device: str = 'cuda',
-    location_ids: Optional[torch.Tensor] = None,
-    location_names: Optional[List[str]] = None,
+    group_id_tensors: Optional[Dict[str, torch.Tensor]] = None,
+    group_names: Optional[Dict[str, List[str]]] = None,
     show_progress: bool = False
 ) -> Dict:
-    """Evaluate once and return overall/per-class plus per-location metrics.
+    """Evaluate once and return overall/per-class plus per-group metrics.
 
-    The optional ``location_ids`` tensor must align with dataset order in
+    The optional group-id tensors must align with dataset order in
     ``dataloader`` (``shuffle=False``).
     """
     model.eval()
     use_cuda = str(device).startswith('cuda')
 
-    max_cls = 20
+    max_cls = max(20, int(getattr(getattr(model, 'fc', None), 'out_features', 20)))
     total_class_counts = torch.zeros(max_cls, device=device, dtype=torch.long)
     correct_class_counts = torch.zeros(max_cls, device=device, dtype=torch.long)
 
-    if location_names is None:
-        location_names = ['Citystreet', 'Countryroad', 'Highway']
-    num_locations = len(location_names)
+    if group_id_tensors is None:
+        group_id_tensors = {}
+    if group_names is None:
+        group_names = {}
 
-    use_location_stats = (
-        location_ids is not None
-        and torch.is_tensor(location_ids)
-        and location_ids.numel() > 0
-        and num_locations > 0
-    )
-
-    location_ids_cpu = None
-    location_total_samples = None
-    location_total_correct = None
-    location_total_class_counts = None
-    location_correct_class_counts = None
-
-    if use_location_stats:
-        assert location_ids is not None
-        location_ids_cpu = location_ids.detach().to(dtype=torch.long, device='cpu')
-        location_total_samples = torch.zeros(num_locations, device=device, dtype=torch.long)
-        location_total_correct = torch.zeros(num_locations, device=device, dtype=torch.long)
-        location_total_class_counts = torch.zeros(num_locations, max_cls, device=device, dtype=torch.long)
-        location_correct_class_counts = torch.zeros(num_locations, max_cls, device=device, dtype=torch.long)
+    active_groups = {}
+    for group_name, names in group_names.items():
+        ids = group_id_tensors.get(group_name)
+        if ids is None or not torch.is_tensor(ids) or ids.numel() == 0 or not names:
+            continue
+        active_groups[group_name] = {
+            'names': list(names),
+            'ids_cpu': ids.detach().to(dtype=torch.long, device='cpu'),
+            'total_samples': torch.zeros(len(names), device=device, dtype=torch.long),
+            'total_correct': torch.zeros(len(names), device=device, dtype=torch.long),
+            'total_class_counts': torch.zeros(len(names), max_cls, device=device, dtype=torch.long),
+            'correct_class_counts': torch.zeros(len(names), max_cls, device=device, dtype=torch.long),
+        }
 
     total_samples = 0
     total_correct = 0
@@ -489,40 +505,39 @@ def evaluate_model_with_locations(
             correct_mask = (predicted == labels)
             correct_class_counts += torch.bincount(labels[correct_mask], minlength=max_cls)[:max_cls]
 
-            if use_location_stats:
-                assert location_ids_cpu is not None
-                assert location_total_samples is not None
-                assert location_total_correct is not None
-                assert location_total_class_counts is not None
-                assert location_correct_class_counts is not None
+            if active_groups:
                 batch_size = int(labels.size(0))
                 next_offset = sample_offset + batch_size
 
-                if next_offset <= int(location_ids_cpu.numel()):
-                    batch_location_ids = location_ids_cpu[sample_offset:next_offset].to(
+                for group_stats in active_groups.values():
+                    ids_cpu = group_stats['ids_cpu']
+                    if next_offset > int(ids_cpu.numel()):
+                        continue
+
+                    batch_group_ids = ids_cpu[sample_offset:next_offset].to(
                         device,
                         non_blocking=True
                     )
 
-                    for loc_id in range(num_locations):
-                        loc_mask = (batch_location_ids == loc_id)
-                        if not bool(loc_mask.any().item()):
+                    for value_id in range(len(group_stats['names'])):
+                        value_mask = (batch_group_ids == value_id)
+                        if not bool(value_mask.any().item()):
                             continue
 
-                        loc_labels = labels[loc_mask]
-                        loc_preds = predicted[loc_mask]
-                        location_total_samples[loc_id] += int(loc_labels.size(0))
-                        location_total_correct[loc_id] += int(loc_preds.eq(loc_labels).sum().item())
+                        value_labels = labels[value_mask]
+                        value_preds = predicted[value_mask]
+                        group_stats['total_samples'][value_id] += int(value_labels.size(0))
+                        group_stats['total_correct'][value_id] += int(value_preds.eq(value_labels).sum().item())
 
-                        location_total_class_counts[loc_id] += torch.bincount(
-                            loc_labels,
+                        group_stats['total_class_counts'][value_id] += torch.bincount(
+                            value_labels,
                             minlength=max_cls
                         )[:max_cls]
 
-                        loc_correct_mask = loc_preds.eq(loc_labels)
-                        if bool(loc_correct_mask.any().item()):
-                            location_correct_class_counts[loc_id] += torch.bincount(
-                                loc_labels[loc_correct_mask],
+                        value_correct_mask = value_preds.eq(value_labels)
+                        if bool(value_correct_mask.any().item()):
+                            group_stats['correct_class_counts'][value_id] += torch.bincount(
+                                value_labels[value_correct_mask],
                                 minlength=max_cls
                             )[:max_cls]
 
@@ -545,36 +560,63 @@ def evaluate_model_with_locations(
         if total > 0:
             per_class_acc[c] = c_counts[c] / total
 
-    location_accuracy = {}
-    location_per_class_acc = {}
-    if use_location_stats:
-        assert location_total_samples is not None
-        assert location_total_correct is not None
-        assert location_total_class_counts is not None
-        assert location_correct_class_counts is not None
-        loc_total_class_np = location_total_class_counts.cpu().numpy()
-        loc_correct_class_np = location_correct_class_counts.cpu().numpy()
+    group_accuracy = {}
+    group_per_class_acc = {}
+    for group_name, group_stats in active_groups.items():
+        group_accuracy[group_name] = {}
+        group_per_class_acc[group_name] = {}
+        total_class_np = group_stats['total_class_counts'].cpu().numpy()
+        correct_class_np = group_stats['correct_class_counts'].cpu().numpy()
 
-        for loc_id, location_name in enumerate(location_names):
-            loc_total = int(location_total_samples[loc_id].item())
-            if loc_total <= 0:
+        for value_id, value_name in enumerate(group_stats['names']):
+            group_total = int(group_stats['total_samples'][value_id].item())
+            if group_total <= 0:
                 continue
 
-            loc_correct = int(location_total_correct[loc_id].item())
-            location_accuracy[location_name] = float(loc_correct / loc_total)
+            group_correct = int(group_stats['total_correct'][value_id].item())
+            group_accuracy[group_name][value_name] = float(group_correct / group_total)
 
-            loc_per_class = {}
+            value_per_class = {}
             for c in range(max_cls):
-                cls_total = int(loc_total_class_np[loc_id][c])
+                cls_total = int(total_class_np[value_id][c])
                 if cls_total > 0:
-                    loc_per_class[c] = float(loc_correct_class_np[loc_id][c] / cls_total)
-            location_per_class_acc[location_name] = loc_per_class
+                    value_per_class[c] = float(correct_class_np[value_id][c] / cls_total)
+            group_per_class_acc[group_name][value_name] = value_per_class
 
     return {
         'accuracy': float(accuracy),
         'per_class_acc': per_class_acc,
-        'location_accuracy': location_accuracy,
-        'location_per_class_acc': location_per_class_acc
+        'group_accuracy': group_accuracy,
+        'group_per_class_acc': group_per_class_acc
+    }
+
+
+def evaluate_model_with_locations(
+    model: nn.Module,
+    dataloader,
+    task_id: int,
+    device: str = 'cuda',
+    location_ids: Optional[torch.Tensor] = None,
+    location_names: Optional[List[str]] = None,
+    show_progress: bool = False
+) -> Dict:
+    """Backward-compatible location-only wrapper."""
+    if location_names is None:
+        location_names = ['Citystreet', 'Countryroad', 'Highway']
+    results = evaluate_model_with_groups(
+        model=model,
+        dataloader=dataloader,
+        task_id=task_id,
+        device=device,
+        group_id_tensors={'location': location_ids} if location_ids is not None else {},
+        group_names={'location': location_names},
+        show_progress=show_progress
+    )
+    return {
+        'accuracy': results['accuracy'],
+        'per_class_acc': results['per_class_acc'],
+        'location_accuracy': results.get('group_accuracy', {}).get('location', {}),
+        'location_per_class_acc': results.get('group_per_class_acc', {}).get('location', {})
     }
 
 
