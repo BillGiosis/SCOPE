@@ -243,7 +243,7 @@ def main(args):
     print(f"{'=' * 60}\n")
     trainer.metrics.print_summary(num_tasks - 1)
 
-    timestamp = datetime.now().strftime("%d%m%Y_%H%M")
+    timestamp = datetime.now().strftime("%d%m%Y_%H%M%S")
     results_file = os.path.join(config['logging']['save_dir'], f'results_{timestamp}.txt')
     os.makedirs(config['logging']['save_dir'], exist_ok=True)
 
@@ -269,6 +269,7 @@ def main(args):
         f.write(f"Data Root: {config['benchmark']['data_root']}\n")
         f.write(f"Evaluation Split: {config['benchmark'].get('eval_split', 'val')}\n")
         f.write(f"Number of Tasks: {num_tasks}\n")
+        f.write(f"Max Params Ratio: {config['benchmark'].get('max_params_ratio', 'N/A')}\n")
         f.write(f"Total Classes: {config['benchmark']['total_classes']}\n")
         f.write(f"Class Names: {', '.join(class_names)}\n")
         f.write(f"Metric Groups: {', '.join(metric_groups.keys())}\n\n")
@@ -287,7 +288,14 @@ def main(args):
         f.write(f"  Replay Buffer Enabled: {config['replay_buffer'].get('enabled', True)}\n")
         f.write(f"  Max Size: {config['replay_buffer']['max_size']}\n")
         f.write(f"  Distillation Temp: {config['replay_buffer']['distillation_temp']}\n")
-        f.write(f"  Replay Batch Size: {config['replay_buffer']['replay_batch_size']}\n\n")
+        f.write(f"  Replay Batch Size: {config['replay_buffer']['replay_batch_size']}\n")
+        f.write(f"  Replay Interval Batches: {config['replay_buffer'].get('replay_interval_batches', 1)}\n")
+        f.write(f"  Fuse Replay Forward: {config['replay_buffer'].get('fuse_replay_forward', False)}\n")
+        f.write(f"  Auto Distill End Of Task: {config['replay_buffer'].get('auto_distill_end_of_task', True)}\n")
+        f.write(
+            "  End Of Task Distill Compression Ratio: "
+            f"{config['replay_buffer'].get('end_of_task_distill_compression_ratio', 'N/A')}\n\n"
+        )
 
         f.write("Data Loading:\n")
         f.write(f"  Num Workers: {config['data_loading']['num_workers']}\n")
@@ -312,6 +320,10 @@ def main(args):
         f.write(f"  Max Amount: {pruning_cfg.get('max_amount', pruning_cfg.get('amount', 0.0))}\n")
         f.write(f"  Scope: {pruning_cfg.get('scope', 'whole_model')}\n")
         f.write(f"  Method: {pruning_cfg.get('method', 'structural')}\n")
+        hybrid_cfg = pruning_cfg.get('hybrid', {})
+        f.write(f"  Hybrid Whole Model Amount: {hybrid_cfg.get('whole_model_amount', 'N/A')}\n")
+        f.write(f"  Hybrid Adapter Amount: {hybrid_cfg.get('adapter_amount', 'N/A')}\n")
+        f.write(f"  Hybrid Adapter Scope: {hybrid_cfg.get('adapter_scope', 'N/A')}\n")
         f.write(f"  Importance: {pruning_cfg.get('importance', 'magnitude')}\n")
         f.write(f"  Use Replay For Taylor: {pruning_cfg.get('use_replay_for_taylor', True)}\n")
         f.write(f"  Taylor Replay Batches: {pruning_cfg.get('taylor_replay_batches', 2)}\n")
@@ -333,6 +345,13 @@ def main(args):
         f.write(f"  Report Efficiency Metrics: {validation_cfg.get('report_efficiency_metrics', True)}\n")
         f.write(f"  Latency Warmup Runs: {validation_cfg.get('latency_warmup_runs', 5)}\n")
         f.write(f"  Latency Runs: {validation_cfg.get('latency_runs', 20)}\n\n")
+        f.write("Logging:\n")
+        f.write(f"  Save Dir: {config['logging']['save_dir']}\n\n")
+
+        f.write("FULL RESOLVED CONFIG\n")
+        f.write("=" * 80 + "\n")
+        f.write(yaml.safe_dump(config, sort_keys=True))
+        f.write("\n")
         f.write("=" * 80 + "\n\n")
 
         if trainer.use_amca and trainer.amca_tester is not None:
@@ -457,8 +476,10 @@ def main(args):
 
     print(f"\nFinal metrics saved to: {results_file}")
 
-    final_path = os.path.join(config['logging']['save_dir'], 'final_model.pt')
+    final_path = os.path.join(config['logging']['save_dir'], f'final_model_{timestamp}.pt')
     trainer.save_checkpoint(final_path, num_tasks - 1)
+    latest_path = os.path.join(config['logging']['save_dir'], 'final_model.pt')
+    trainer.save_checkpoint(latest_path, num_tasks - 1)
 
 
 if __name__ == "__main__":

@@ -186,6 +186,12 @@ class ReplayBuffer:
         b_labels = self.labels[batch_indices]
         b_tasks = self.task_ids[batch_indices]
         b_soft = self.soft_targets[batch_indices] if self.soft_targets is not None else None
+
+        b_images = b_images.contiguous()
+        b_labels = b_labels.contiguous()
+        b_tasks = b_tasks.contiguous()
+        if b_soft is not None:
+            b_soft = b_soft.contiguous()
         
         if device is None:
             return {

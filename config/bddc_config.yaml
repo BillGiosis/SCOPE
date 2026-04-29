@@ -19,9 +19,11 @@ training:
 
 replay_buffer:
   enabled: true
-  max_size: 10000
+  max_size: 5000
   distillation_temp: 1.5
   replay_batch_size: 32
+  replay_interval_batches: 4
+  fuse_replay_forward: true
   auto_distill_end_of_task: true
   end_of_task_distill_compression_ratio: 0.90
 

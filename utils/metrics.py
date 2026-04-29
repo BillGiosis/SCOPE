@@ -60,7 +60,8 @@ class AMCATester:
                 labels = labels.to(device, non_blocking=True)
 
                 # Standard forward pass
-                outputs = model(images)
+                with torch.amp.autocast('cuda', enabled=use_cuda):
+                    outputs = model(images)
 
                 _, predicted = outputs.max(1)
 
@@ -205,6 +206,77 @@ class MetricsTracker:
         
         # Task training times
         self.task_times = {}
+
+    @staticmethod
+    def _nested_defaultdict_dict():
+        return defaultdict(dict)
+
+    @staticmethod
+    def _nested_defaultdict_list():
+        return defaultdict(list)
+
+    @staticmethod
+    def _to_plain_dict(value):
+        """Recursively convert defaultdicts to pickle-safe plain dictionaries."""
+        if isinstance(value, defaultdict):
+            value = dict(value)
+        if isinstance(value, dict):
+            return {key: MetricsTracker._to_plain_dict(child) for key, child in value.items()}
+        if isinstance(value, list):
+            return [MetricsTracker._to_plain_dict(child) for child in value]
+        return value
+
+    @staticmethod
+    def _to_group_task_defaultdict(value):
+        result = defaultdict(MetricsTracker._nested_defaultdict_dict)
+        for group_name, task_values in (value or {}).items():
+            nested = MetricsTracker._nested_defaultdict_dict()
+            for task_id, group_values in (task_values or {}).items():
+                nested[task_id] = dict(group_values or {})
+            result[group_name] = nested
+        return result
+
+    @staticmethod
+    def _to_group_history_defaultdict(value):
+        result = defaultdict(MetricsTracker._nested_defaultdict_list)
+        for group_name, group_values in (value or {}).items():
+            nested = MetricsTracker._nested_defaultdict_list()
+            for group_value, history in (group_values or {}).items():
+                nested[group_value] = list(history or [])
+            result[group_name] = nested
+        return result
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['task_accuracies'] = self._to_plain_dict(self.task_accuracies)
+        state['task_group_accuracies'] = self._to_plain_dict(self.task_group_accuracies)
+        state['task_group_class_accuracies'] = self._to_plain_dict(self.task_group_class_accuracies)
+        state['group_mca_history'] = self._to_plain_dict(self.group_mca_history)
+        state['group_overall_history'] = self._to_plain_dict(self.group_overall_history)
+
+        # Aliases are reconstructed in __setstate__ to avoid serializing duplicate
+        # views backed by lambda defaultdict factories.
+        state.pop('task_location_accuracies', None)
+        state.pop('task_location_class_accuracies', None)
+        state.pop('location_mca_history', None)
+        state.pop('location_overall_history', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.task_accuracies = defaultdict(list, {
+            task_id: list(values)
+            for task_id, values in self.task_accuracies.items()
+        })
+        self.task_group_accuracies = self._to_group_task_defaultdict(self.task_group_accuracies)
+        self.task_group_class_accuracies = self._to_group_task_defaultdict(self.task_group_class_accuracies)
+        self.group_mca_history = self._to_group_history_defaultdict(self.group_mca_history)
+        self.group_overall_history = self._to_group_history_defaultdict(self.group_overall_history)
+
+        self.task_location_accuracies = self.task_group_accuracies['location']
+        self.task_location_class_accuracies = self.task_group_class_accuracies['location']
+        self.location_mca_history = self.group_mca_history['location']
+        self.location_overall_history = self.group_overall_history['location']
         
     def update_accuracy(self, task_id: int, accuracy: float, class_accuracies: Optional[Dict[int, float]] = None):
         """Record accuracy for a specific task."""
@@ -387,7 +459,8 @@ def evaluate_model(
             labels = labels.to(device, non_blocking=True)
 
             # Forward pass
-            outputs = model(images)
+            with torch.amp.autocast('cuda', enabled=use_cuda):
+                outputs = model(images)
 
             _, predicted = outputs.max(1)
 
@@ -494,7 +567,8 @@ def evaluate_model_with_groups(
                 images = images.to(device, dtype=torch.float32, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            outputs = model(images)
+            with torch.amp.autocast('cuda', enabled=use_cuda):
+                outputs = model(images)
             _, predicted = outputs.max(1)
 
             batch_correct = predicted.eq(labels).sum().item()

@@ -553,7 +553,8 @@ class ContinualLearner:
                     images = images.to(self.device, dtype=torch.float32, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
 
-                outputs = self.model(images)
+                with torch.amp.autocast('cuda', enabled=self.use_amp):
+                    outputs = self.model(images)
                 predicted = outputs.argmax(dim=1)
 
                 class_total += torch.bincount(labels, minlength=max_cls)[:max_cls]
@@ -1360,6 +1361,8 @@ class ContinualLearner:
         use_cuda = (self.device == 'cuda')
         replay_enabled = bool(replay_config.get('enabled', True))
         replay_batch_size = max(1, int(replay_config.get('replay_batch_size', 32)))
+        replay_interval_batches = max(1, int(replay_config.get('replay_interval_batches', 1)))
+        fuse_replay_forward = bool(replay_config.get('fuse_replay_forward', False))
         replay_buffer_len = len(self.replay_buffer) if replay_enabled else 0
         has_replay_data = replay_enabled and replay_buffer_len > 0
         criterion = self.criterion
@@ -1479,8 +1482,46 @@ class ContinualLearner:
                         if selected_chunks:
                             capture_indices = torch.cat(selected_chunks, dim=0)
 
-                with torch.amp.autocast('cuda', enabled=self.use_amp):
-                    outputs = train_forward(images)
+                replay_batch = None
+                r_imgs = None
+                r_lbls = None
+                r_out = None
+                use_replay_this_batch = (
+                    has_replay_data
+                    and ((batch_idx + 1) % replay_interval_batches == 0)
+                )
+
+                if use_replay_this_batch:
+                    replay_batch = self.replay_buffer.get_batch(
+                        batch_size=min(replay_batch_size, replay_buffer_len)
+                    )
+
+                    if replay_batch is not None:
+                        if use_cuda:
+                            r_imgs = replay_batch['images'].to(
+                                self.device,
+                                dtype=torch.float32,
+                                non_blocking=True,
+                                memory_format=torch.channels_last
+                            )
+                        else:
+                            r_imgs = replay_batch['images'].to(
+                                self.device,
+                                dtype=torch.float32,
+                                non_blocking=True
+                            )
+                        r_lbls = replay_batch['labels'].to(self.device, non_blocking=True)
+
+                if fuse_replay_forward and r_imgs is not None:
+                    combined_images = torch.cat((images, r_imgs), dim=0)
+                    current_batch_size = int(images.size(0))
+                    with torch.amp.autocast('cuda', enabled=self.use_amp):
+                        combined_outputs = train_forward(combined_images)
+                    outputs = combined_outputs[:current_batch_size]
+                    r_out = combined_outputs[current_batch_size:]
+                else:
+                    with torch.amp.autocast('cuda', enabled=self.use_amp):
+                        outputs = train_forward(images)
                 
                 if capture_indices is not None and capture_indices.numel() > 0:
                     selected_images = images.index_select(0, capture_indices).detach().cpu()
@@ -1506,49 +1547,28 @@ class ContinualLearner:
                 else:
                     loss = F.cross_entropy(outputs_float, labels)
             
-                if has_replay_data:
-                    replay_batch = self.replay_buffer.get_batch(
-                        batch_size=min(replay_batch_size, replay_buffer_len)
-                    )
-                    
-                    if replay_batch is not None:
-                        if use_cuda:
-                            r_imgs = replay_batch['images'].to(
-                                self.device,
-                                dtype=torch.float32,
-                                non_blocking=True,
-                                memory_format=torch.channels_last
-                            )
-                        else:
-                            r_imgs = replay_batch['images'].to(
-                                self.device,
-                                dtype=torch.float32,
-                                non_blocking=True
-                            )
-                        
-                        r_lbls = replay_batch['labels'].to(self.device, non_blocking=True)
-                        
+                if replay_batch is not None and r_imgs is not None and r_lbls is not None:
+                    if r_out is None:
                         with torch.amp.autocast('cuda', enabled=self.use_amp):
                             r_out = train_forward(r_imgs)
 
-                        if has_class_balanced_loss:
-                            loss += 0.5 * criterion(r_out.float(), r_lbls)
-                        else:
-                            loss += 0.5 * F.cross_entropy(r_out.float(), r_lbls)
-                        
-                        if replay_batch['soft_targets'] is not None:
-                            soft_targets = replay_batch['soft_targets'].to(self.device, non_blocking=True).float()
-                            
-                            # Logits already computed in r_out usually, but we check structure differences.
-                            # Re-using r_out for distillation if it matches soft_target shape
-                            if r_out.size(1) == soft_targets.size(1):
-                                r_out_dist = r_out
-                            else:
-                                with torch.amp.autocast('cuda', enabled=self.use_amp):
-                                    r_out_dist = train_forward(r_imgs)
+                    if has_class_balanced_loss:
+                        loss += 0.5 * criterion(r_out.float(), r_lbls)
+                    else:
+                        loss += 0.5 * F.cross_entropy(r_out.float(), r_lbls)
 
-                            log_probs = F.log_softmax(r_out_dist.float() / distill_temp, dim=1)
-                            loss += 0.3 * (distill_temp ** 2) * F.kl_div(log_probs, soft_targets, reduction='batchmean')
+                    if replay_batch['soft_targets'] is not None:
+                        soft_targets = replay_batch['soft_targets'].to(self.device, non_blocking=True).float()
+
+                        # Re-use replay logits from the fused/current replay forward when dimensions match.
+                        if r_out.size(1) == soft_targets.size(1):
+                            r_out_dist = r_out
+                        else:
+                            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                                r_out_dist = train_forward(r_imgs)
+
+                        log_probs = F.log_softmax(r_out_dist.float() / distill_temp, dim=1)
+                        loss += 0.3 * (distill_temp ** 2) * F.kl_div(log_probs, soft_targets, reduction='batchmean')
 
                 if not torch.isfinite(loss).all():
                     nonfinite_batches += 1
@@ -2572,7 +2592,9 @@ class ContinualLearner:
         return int(delta)
 
     def save_checkpoint(self, path: str, task_id: int):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        checkpoint_dir = os.path.dirname(path)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        tmp_path = f"{path}.tmp"
         torch.save({
             'task_id': task_id,
             'model_state_dict': self.model.state_dict(),
@@ -2581,10 +2603,11 @@ class ContinualLearner:
             'task_expansions': self.task_expansions,
             'expansion_history': self.expansion_history,
             'pruning_history': self.pruning_history
-        }, path)
+        }, tmp_path)
+        os.replace(tmp_path, path)
 
     def load_checkpoint(self, path: str):
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.metrics = checkpoint['metrics']
         self.task_expansions = checkpoint.get('task_expansions', {})
