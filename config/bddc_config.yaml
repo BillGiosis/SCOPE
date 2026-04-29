@@ -5,7 +5,7 @@ benchmark:
   eval_split: "val"
   num_tasks: 5
 
-  max_params_ratio: 1.15
+  max_params_ratio: 1.25
 
 training:
   batch_size: 64
@@ -15,7 +15,7 @@ training:
   weight_decay: 0.01
   use_amp: true
 
-  cb_beta: 0.9999
+  cb_beta: 0.999
 
 replay_buffer:
   enabled: true
@@ -62,10 +62,10 @@ network_pruning:
   rollback:
     enabled: true
     max_mca_drop: 0.015
-    eval_max_batches: 15
+    eval_max_batches: 40
   recovery:
     enabled: true
-    epochs: 2
+    epochs: 3
     learning_rate_scale: 0.2
   validation:
     report_efficiency_metrics: true

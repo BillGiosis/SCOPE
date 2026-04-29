@@ -288,13 +288,6 @@ def main(args):
         f.write("Logging:\n")
         f.write(f"  Save Dir: {config['logging']['save_dir']}\n\n")
 
-        f.write("FULL RESOLVED CONFIG\n")
-        f.write("=" * 80 + "\n")
-        f.write(yaml.safe_dump(config, sort_keys=True))
-        f.write("\n")
-        
-        f.write("="*80 + "\n\n")
-        
         # AMCA metrics
         if trainer.use_amca and trainer.amca_tester is not None:
             amca_summary = trainer.amca_tester.get_summary()
@@ -426,19 +419,9 @@ def main(args):
         else:
             f.write("Final Overall Model Accuracy: N/A\n")
             
-        # Final Per-Class Accuracy
-        f.write("\nFinal Per-Class Accuracies:\n")
-        if final_task_id in trainer.metrics.task_class_accuracies:
-            final_class_stats = trainer.metrics.task_class_accuracies[final_task_id]
-            for class_id in range(num_classes):
-                class_name = class_names[class_id] if class_id < len(class_names) else f"Class {class_id}"
-                if class_id in final_class_stats:
-                    acc = final_class_stats[class_id]
-                    f.write(f"  {class_name}: {acc:.4f}\n")
-                else:
-                    f.write(f"  {class_name}: N/A\n")
-        else:
-            f.write("  N/A\n")
+        f.write(
+            f"\nFinal Per-Class Accuracies: see 'Per-Class Accuracies at End of Each Task' -> Task {final_task_id}\n"
+        )
         
         # Average Per-Class Accuracies (across all tasks)
         f.write("\nAverage Per-Class Accuracies (across all evaluations):\n")
@@ -464,26 +447,11 @@ def main(args):
         else:
             f.write("  N/A\n")
 
-        # Final per-location per-class metrics and location AMCA
-        f.write("\nFinal Per-Location Per-Class Accuracies:\n")
-        if final_task_id in trainer.metrics.task_location_class_accuracies:
-            final_loc_stats = trainer.metrics.task_location_class_accuracies[final_task_id]
-            for location in ['Citystreet', 'Countryroad', 'Highway']:
-                if location not in final_loc_stats:
-                    f.write(f"  {location}: N/A\n")
-                    continue
-                f.write(f"  {location}:\n")
-                loc_class_stats = final_loc_stats[location]
-                for class_id in range(1, num_classes):
-                    class_name = class_names[class_id]
-                    if class_id in loc_class_stats:
-                        f.write(f"    {class_name}: {loc_class_stats[class_id]:.4f}\n")
-                    else:
-                        f.write(f"    {class_name}: N/A\n")
-                loc_mca = float(sum(loc_class_stats.values()) / len(loc_class_stats)) if loc_class_stats else 0.0
-                f.write(f"    MCA: {loc_mca:.4f}\n")
-        else:
-            f.write("  N/A\n")
+        if trainer.metrics.task_location_class_accuracies:
+            f.write(
+                "Final Per-Location Per-Class Accuracies: "
+                f"see 'Per-Location Per-Class Accuracies at End of Each Task' -> Task {final_task_id}\n"
+            )
 
         f.write("\nPer-Location AMCA (across all evaluations):\n")
         for location in ['Citystreet', 'Countryroad', 'Highway']:

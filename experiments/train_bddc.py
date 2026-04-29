@@ -101,40 +101,7 @@ def _write_group_sections(f, trainer, num_tasks: int, class_names, metric_groups
         f.write("\n")
 
 
-def _write_final_group_sections(f, trainer, final_task_id: int, class_names, metric_groups):
-    f.write("\nFinal Grouped Per-Class Accuracies:\n")
-
-    any_output = False
-    for group_name, group_values in metric_groups.items():
-        if not group_values:
-            continue
-
-        title = group_name.replace('_', ' ').title()
-        f.write(f"  {title}:\n")
-        task_group_stats = trainer.metrics.task_group_class_accuracies.get(group_name, {})
-        final_group_stats = task_group_stats.get(final_task_id, {})
-
-        if not final_group_stats:
-            f.write("    N/A\n")
-            continue
-
-        any_output = True
-        for group_value in group_values:
-            if group_value not in final_group_stats:
-                f.write(f"    {group_value}: N/A\n")
-                continue
-            f.write(f"    {group_value}:\n")
-            per_class = final_group_stats[group_value]
-            for class_id, class_name in enumerate(class_names):
-                if class_id in per_class:
-                    f.write(f"      {class_name}: {per_class[class_id]:.4f}\n")
-                else:
-                    f.write(f"      {class_name}: N/A\n")
-            f.write(f"      MCA: {_avg(list(per_class.values())):.4f}\n")
-
-    if not any_output:
-        f.write("  N/A\n")
-
+def _write_group_amca_summary(f, trainer, metric_groups):
     f.write("\nGrouped AMCA (across all evaluations):\n")
     for group_name, group_values in metric_groups.items():
         title = group_name.replace('_', ' ').title()
@@ -348,12 +315,6 @@ def main(args):
         f.write("Logging:\n")
         f.write(f"  Save Dir: {config['logging']['save_dir']}\n\n")
 
-        f.write("FULL RESOLVED CONFIG\n")
-        f.write("=" * 80 + "\n")
-        f.write(yaml.safe_dump(config, sort_keys=True))
-        f.write("\n")
-        f.write("=" * 80 + "\n\n")
-
         if trainer.use_amca and trainer.amca_tester is not None:
             amca_summary = trainer.amca_tester.get_summary()
             f.write(f"AMCA Score: {amca_summary['amca']:.4f}\n")
@@ -443,16 +404,14 @@ def main(args):
             f"{final_overall_acc[-1]:.4f}\n" if final_overall_acc else "Final Overall Model Accuracy: N/A\n"
         )
 
-        f.write("\nFinal Per-Class Accuracies:\n")
-        final_class_stats = trainer.metrics.task_class_accuracies.get(final_task_id, {})
-        if final_class_stats:
-            for class_id, class_name in enumerate(class_names):
-                if class_id in final_class_stats:
-                    f.write(f"  {class_name}: {final_class_stats[class_id]:.4f}\n")
-                else:
-                    f.write(f"  {class_name}: N/A\n")
-        else:
-            f.write("  N/A\n")
+        f.write(
+            f"Final Per-Class Accuracies: see 'Per-Class Accuracies at End of Each Task' -> Task {final_task_id}\n"
+        )
+        if metric_groups:
+            f.write(
+                "Final Grouped Per-Class Accuracies: "
+                f"see grouped history sections above -> Task {final_task_id}\n"
+            )
 
         f.write("\nAverage Per-Class Accuracies (across all evaluations):\n")
         if trainer.metrics.task_class_accuracies:
@@ -471,7 +430,7 @@ def main(args):
         else:
             f.write("  N/A\n")
 
-        _write_final_group_sections(f, trainer, final_task_id, class_names, metric_groups)
+        _write_group_amca_summary(f, trainer, metric_groups)
         f.write("\n" + "=" * 80 + "\n")
 
     print(f"\nFinal metrics saved to: {results_file}")
