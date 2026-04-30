@@ -15,20 +15,20 @@ training:
   weight_decay: 0.01
   use_amp: true
 
-  cb_beta: 0.999
+  cb_beta: 0.9999
 
 replay_buffer:
   enabled: true
   max_size: 5000
   distillation_temp: 1.5
   replay_batch_size: 32
-  replay_interval_batches: 4
+  replay_interval_batches: 2
   fuse_replay_forward: true
   auto_distill_end_of_task: true
   end_of_task_distill_compression_ratio: 0.90
 
 data_loading:
-  num_workers: 24
+  num_workers: 32
   pin_memory: true
   prefetch_factor: 4
 
@@ -51,7 +51,7 @@ network_pruning:
     adapter_scope: "older_adapters_only"
   importance: "taylor"
   use_replay_for_taylor: true
-  taylor_replay_batches: 8
+  taylor_replay_batches: 6
   taylor_train_batches: 2
   taylor_replay_batch_size: 32
   rebuild_optimizer_after_prune: true
@@ -65,7 +65,7 @@ network_pruning:
     eval_max_batches: 40
   recovery:
     enabled: true
-    epochs: 3
+    epochs: 2
     learning_rate_scale: 0.2
   validation:
     report_efficiency_metrics: true

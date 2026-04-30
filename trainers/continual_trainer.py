@@ -980,23 +980,36 @@ class ContinualLearner:
     ):
         """Create optimizer for current trainable parameters."""
         lr = self.learning_rate if learning_rate is None else learning_rate
-        use_fused = (self.device == 'cuda')
-        extra_args = {}
-        if use_fused:
-            extra_args['fused'] = True
+        optimizer_name = self.optimizer_name.lower()
+        trainable_parameters = filter(lambda p: p.requires_grad, self.model.parameters())
 
-        if self.optimizer_name.lower() != 'adamw':
-            raise ValueError(
-                f"Unsupported optimizer '{self.optimizer_name}'. Only 'adamw' is supported."
+        if optimizer_name == 'adamw':
+            use_fused = (self.device == 'cuda')
+            extra_args = {}
+            if use_fused:
+                extra_args['fused'] = True
+
+            self.optimizer = optim.AdamW(
+                trainable_parameters,
+                lr=lr,
+                weight_decay=self.weight_decay,
+                eps=1e-8,
+                **extra_args
             )
-
-        self.optimizer = optim.AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=lr,
-            weight_decay=self.weight_decay,
-            eps=1e-8,
-            **extra_args
-        )
+        elif optimizer_name == 'sgd':
+            momentum = float(self.config.get('training', {}).get('momentum', 0.9))
+            nesterov = bool(self.config.get('training', {}).get('nesterov', False))
+            self.optimizer = optim.SGD(
+                trainable_parameters,
+                lr=lr,
+                momentum=momentum,
+                weight_decay=self.weight_decay,
+                nesterov=nesterov
+            )
+        else:
+            raise ValueError(
+                f"Unsupported optimizer '{self.optimizer_name}'. Supported optimizers: adamw, sgd."
+            )
 
         t_max = self.epochs_per_task if scheduler_tmax is None else max(1, int(scheduler_tmax))
         
