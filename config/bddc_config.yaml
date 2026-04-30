@@ -15,6 +15,7 @@ training:
   weight_decay: 0.01
   use_amp: true
 
+  use_weighted_sampler: true
   cb_beta: 0.9999
 
 replay_buffer:
