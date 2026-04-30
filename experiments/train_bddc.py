@@ -210,7 +210,7 @@ def main(args):
     print(f"{'=' * 60}\n")
     trainer.metrics.print_summary(num_tasks - 1)
 
-    timestamp = datetime.now().strftime("%d%m%Y_%H%M%S")
+    timestamp = datetime.now().strftime("%d%m%Y_%H%M")
     results_file = os.path.join(config['logging']['save_dir'], f'results_{timestamp}.txt')
     os.makedirs(config['logging']['save_dir'], exist_ok=True)
 

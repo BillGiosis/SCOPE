@@ -1145,7 +1145,8 @@ class ContinualLearner:
             beta=self.config['training'].get('cb_beta', 0.9999)
         ).to(self.device)
         
-        if hasattr(self.criterion, 'weights'):
+        benchmark_name = str(self.config.get('benchmark', {}).get('name', '')).strip().lower()
+        if benchmark_name == 'clad-c' and hasattr(self.criterion, 'weights') and self.criterion.weights.numel() > 0:
             self.criterion.weights[0] = 0.0
             
         # Reuse one loader for all evals in this task

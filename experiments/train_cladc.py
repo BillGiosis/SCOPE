@@ -173,7 +173,7 @@ def main(args):
     
     # Save final metrics to file with timestamp
     from datetime import datetime
-    timestamp = datetime.now().strftime("%d%m%Y_%H%M%S")
+    timestamp = datetime.now().strftime("%d%m%Y_%H%M")
     
     # Get AMCA score
     amca_score = 0.0
