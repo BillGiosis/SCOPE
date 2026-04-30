@@ -249,7 +249,8 @@ def main(args):
         f.write(f"  Weight Decay: {config['training']['weight_decay']}\n")
         f.write(f"  AMP: {config['training'].get('use_amp', False)}\n")
         f.write("  Gradient Accumulation: False\n")
-        f.write(f"  Class Balanced Beta: {config['training'].get('cb_beta', 'N/A')}\n\n")
+        f.write(f"  Class Balanced Beta: {config['training'].get('cb_beta', 'N/A')}\n")
+        f.write(f"  Weighted Sampler: {config['training'].get('use_weighted_sampler', config.get('data_loading', {}).get('use_weighted_sampler', True))}\n\n")
 
         f.write("Replay Buffer:\n")
         f.write(f"  Replay Buffer Enabled: {config['replay_buffer'].get('enabled', True)}\n")
