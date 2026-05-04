@@ -403,7 +403,7 @@ class MetricsTracker:
         summary = self.get_summary(current_task)
         
         print("\n" + "="*60)
-        print(f"Metrics Summary (After Task {current_task})")
+        print(f"Metrics Summary (After Task {int(current_task) + 1})")
         print("="*60)
         print(f"Average Accuracy:     {summary['average_accuracy']:.4f}")
         print(f"Forgetting:           {summary['forgetting']:.4f}")
@@ -412,7 +412,7 @@ class MetricsTracker:
         print(f"Parameters:           {summary['num_parameters']:,}")
         print("\nPer-Task Accuracies:")
         for task_id, acc in sorted(summary['task_accuracies'].items()):
-            print(f"  Task {task_id}: {acc:.4f}")
+            print(f"  Task {int(task_id) + 1}: {acc:.4f}")
         print("="*60 + "\n")
 
 
@@ -444,7 +444,7 @@ def evaluate_model(
         iterator = dataloader
         if show_progress:
             from tqdm import tqdm
-            iterator = tqdm(dataloader, desc=f"Task {task_id}", leave=False)
+            iterator = tqdm(dataloader, desc=f"Task {int(task_id) + 1}", leave=False)
 
         for batch_idx, (images, labels) in enumerate(iterator):
             if use_cuda:
@@ -553,7 +553,7 @@ def evaluate_model_with_groups(
         iterator = dataloader
         if show_progress:
             from tqdm import tqdm
-            iterator = tqdm(dataloader, desc=f"Task {task_id}", leave=False)
+            iterator = tqdm(dataloader, desc=f"Task {int(task_id) + 1}", leave=False)
 
         for batch_idx, (images, labels) in enumerate(iterator):
             if use_cuda:

@@ -60,6 +60,10 @@ def _avg(values):
     return float(sum(values) / len(values)) if values else 0.0
 
 
+def _task_label(task_id: int) -> int:
+    return int(task_id) + 1
+
+
 def _write_group_sections(f, trainer, num_tasks: int, class_names, metric_groups):
     group_class_stats = trainer.metrics.task_group_class_accuracies
     if not group_class_stats:
@@ -76,7 +80,7 @@ def _write_group_sections(f, trainer, num_tasks: int, class_names, metric_groups
             task_stats = group_task_stats.get(task_id, {})
             if not task_stats:
                 continue
-            f.write(f"\n  Task {task_id}:\n")
+            f.write(f"\n  Task {_task_label(task_id)}:\n")
             for group_value in group_values:
                 if group_value not in task_stats:
                     continue
@@ -330,7 +334,7 @@ def main(args):
                 task_mcas = mca_list[start_idx:end_idx]
                 if task_mcas:
                     f.write(
-                        f"  During Task {task_id}: "
+                        f"  During Task {_task_label(task_id)}: "
                         f"Final MCA={task_mcas[-1]:.4f}, Best MCA={max(task_mcas):.4f}\n"
                     )
             f.write("\n")
@@ -339,7 +343,7 @@ def main(args):
         for task_id in range(num_tasks):
             accs = trainer.metrics.task_accuracies.get(task_id, [])
             if accs:
-                f.write(f"  End of Task {task_id}: {accs[-1]:.4f}\n")
+                f.write(f"  End of Task {_task_label(task_id)}: {accs[-1]:.4f}\n")
         f.write("\n")
 
         f.write("Per-Class Accuracies at End of Each Task:\n")
@@ -347,7 +351,7 @@ def main(args):
             class_stats = trainer.metrics.task_class_accuracies.get(task_id)
             if not class_stats:
                 continue
-            f.write(f"\n  Task {task_id}:\n")
+            f.write(f"\n  Task {_task_label(task_id)}:\n")
             for class_id, class_name in enumerate(class_names):
                 if class_id in class_stats:
                     f.write(f"    {class_name}: {class_stats[class_id]:.4f}\n")
@@ -374,20 +378,20 @@ def main(args):
         for task_id in range(num_tasks):
             expansions = trainer.task_expansions.get(task_id, [])
             if expansions:
-                f.write(f"  Task {task_id}: {', '.join(expansions)}\n")
+                f.write(f"  Task {_task_label(task_id)}: {', '.join(expansions)}\n")
             else:
-                f.write(f"  Task {task_id}: none\n")
+                f.write(f"  Task {_task_label(task_id)}: none\n")
 
         f.write("\nNetwork Pruning Per Task:\n")
         pruning_by_task = {entry['task_id']: entry for entry in trainer.pruning_history}
         for task_id in range(num_tasks):
             entry = pruning_by_task.get(task_id)
             if not entry:
-                f.write(f"  Task {task_id}: none\n")
+                f.write(f"  Task {_task_label(task_id)}: none\n")
                 continue
             rollback_suffix = ', rollback=applied' if entry.get('rolled_back', False) else ''
             f.write(
-                f"  Task {task_id}: pruned={entry['pruned_params']:,}, "
+                f"  Task {_task_label(task_id)}: pruned={entry['pruned_params']:,}, "
                 f"effective={entry['effective_params_before']:,}->{entry['effective_params_after']:,}, "
                 f"amount={entry['amount']:.4f}, scope={entry['scope']}, "
                 f"method={entry.get('method', 'unstructured')}, "
@@ -406,12 +410,12 @@ def main(args):
         )
 
         f.write(
-            f"Final Per-Class Accuracies: see 'Per-Class Accuracies at End of Each Task' -> Task {final_task_id}\n"
+            f"Final Per-Class Accuracies: see 'Per-Class Accuracies at End of Each Task' -> Task {_task_label(final_task_id)}\n"
         )
         if metric_groups:
             f.write(
                 "Final Grouped Per-Class Accuracies: "
-                f"see grouped history sections above -> Task {final_task_id}\n"
+                f"see grouped history sections above -> Task {_task_label(final_task_id)}\n"
             )
 
         f.write("\nAverage Per-Class Accuracies (across all evaluations):\n")

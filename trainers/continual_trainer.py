@@ -223,6 +223,11 @@ class ContinualLearner:
         self._cached_location_ids: Dict[int, torch.Tensor] = {}
         self._cached_group_ids: Dict[int, Dict[str, torch.Tensor]] = {}
 
+    @staticmethod
+    def _task_label(task_id: int) -> int:
+        """Return the user-facing 1-indexed task number."""
+        return int(task_id) + 1
+
     def _is_pruning_task(self, task_id: int) -> bool:
         """Return whether pruning should run for this task id under warmup/interval rules."""
         if not self.pruning_enabled:
@@ -404,7 +409,7 @@ class ContinualLearner:
             self.task_expansions[task_id] = executed
             return
 
-        print(f"\n--- Task-Start Network Expansion (Task {task_id}) ---")
+        print(f"\n--- Task-Start Network Expansion (Task {self._task_label(task_id)}) ---")
         targets = self._get_task_expansion_targets(task_id)
         if not targets:
             print("No expansion targets configured")
@@ -415,7 +420,7 @@ class ContinualLearner:
             if self._try_expand_layer(layer_name):
                 executed.append(layer_name)
             else:
-                print(f"No eligible expansion executed for {layer_name} at task {task_id}.")
+                print(f"No eligible expansion executed for {layer_name} at task {self._task_label(task_id)}.")
 
         self.task_expansions[task_id] = executed
         for layer_name in executed:
@@ -612,7 +617,7 @@ class ContinualLearner:
             self.last_good_task_id = int(task_id)
             return True
         except Exception as e:
-            print(f"[WARNING] Could not snapshot last-good model at task {task_id}: {e}")
+            print(f"[WARNING] Could not snapshot last-good model at task {self._task_label(task_id)}: {e}")
             return False
 
     def _restore_last_good_model(self, task_id: int) -> bool:
@@ -627,8 +632,8 @@ class ContinualLearner:
             self.model = restored
             self.train_model = self.model
             print(
-                f"Restored last-good model snapshot from task {self.last_good_task_id} "
-                f"before starting task {task_id}"
+                f"Restored last-good model snapshot from task {self._task_label(self.last_good_task_id)} "
+                f"before starting task {self._task_label(task_id)}"
             )
             return True
         except Exception as e:
@@ -837,10 +842,10 @@ class ContinualLearner:
         if not self.prune_rollback_enabled:
             return False
         if eval_loader is None:
-            print(f"Skipping prune rollback check at task {task_id}: no evaluation loader")
+            print(f"Skipping prune rollback check at task {self._task_label(task_id)}: no evaluation loader")
             return False
         if pre_prune_mca is None:
-            print(f"Skipping prune rollback check at task {task_id}: pre-prune MCA unavailable")
+            print(f"Skipping prune rollback check at task {self._task_label(task_id)}: pre-prune MCA unavailable")
             return False
 
         try:
@@ -866,7 +871,7 @@ class ContinualLearner:
 
         if not rollback_needed:
             print(
-                f"Prune rollback check passed at task {task_id}: "
+                f"Prune rollback check passed at task {self._task_label(task_id)}: "
                 f"MCA drop={mca_drop:.4f} <= threshold={self.prune_rollback_max_mca_drop:.4f}"
             )
             if self.pruning_history and self.pruning_history[-1].get('task_id') == int(task_id):
@@ -876,7 +881,7 @@ class ContinualLearner:
         restored = self._restore_model_from_snapshot(snapshot_model=snapshot_model, task_id=task_id)
         if not restored:
             print(
-                f"[WARNING] Prune rollback triggered at task {task_id} but restore failed; "
+                f"[WARNING] Prune rollback triggered at task {self._task_label(task_id)} but restore failed; "
                 "keeping pruned model."
             )
             if self.pruning_history and self.pruning_history[-1].get('task_id') == int(task_id):
@@ -885,7 +890,7 @@ class ContinualLearner:
             return False
 
         print(
-            f"Rolled back pruning at task {task_id}: "
+            f"Rolled back pruning at task {self._task_label(task_id)}: "
             f"MCA drop={mca_drop:.4f} > threshold={self.prune_rollback_max_mca_drop:.4f}"
         )
         if self.pruning_history and self.pruning_history[-1].get('task_id') == int(task_id):
@@ -908,7 +913,7 @@ class ContinualLearner:
                 learning_rate=learning_rate,
                 scheduler_tmax=scheduler_tmax
             )
-            print(f"Rebuilt optimizer after pruning for task {task_id}")
+            print(f"Rebuilt optimizer after pruning for task {self._task_label(task_id)}")
 
         self.train_model = self.model
         if self.recompile_after_prune and self.use_torch_compile:
@@ -919,9 +924,9 @@ class ContinualLearner:
                 except Exception:
                     pass
                 self.train_model = torch.compile(self.model)
-                print(f"Recompiled training model after pruning for task {task_id}")
+                print(f"Recompiled training model after pruning for task {self._task_label(task_id)}")
             except Exception as e:
-                print(f"Could not recompile training model after pruning for task {task_id}: {e}")
+                print(f"Could not recompile training model after pruning for task {self._task_label(task_id)}: {e}")
                 self.train_model = self.model
 
     def _prepare_training_model_for_task(self, task_id: int):
@@ -934,9 +939,9 @@ class ContinualLearner:
 
         try:
             self.train_model = torch.compile(self.model)
-            print(f"Compiled training model for task {task_id}")
+            print(f"Compiled training model for task {self._task_label(task_id)}")
         except Exception as e:
-            print(f"Could not compile training model for task {task_id}: {e}")
+            print(f"Could not compile training model for task {self._task_label(task_id)}: {e}")
             self.train_model = self.model
 
     def _try_expand_layer(self, layer_name: str) -> bool:
@@ -1064,19 +1069,19 @@ class ContinualLearner:
     def train_task(self, task_id: int, train_loader: DataLoader, test_loaders: List[DataLoader]):
         """Train on a single task."""
         print(f"\n{'='*60}")
-        print(f"Training Task {task_id}")
+        print(f"Training Task {self._task_label(task_id)}")
         print(f"{'='*60}\n")
         
-        if not check_model_health(self.model, f"Task {task_id} start"):
+        if not check_model_health(self.model, f"Task {self._task_label(task_id)} start"):
             restored = self._restore_last_good_model(task_id)
             if not restored:
                 raise RuntimeError(
-                    f"Model corrupted before Task {task_id}, and no healthy snapshot is available. "
+                    f"Model corrupted before Task {self._task_label(task_id)}, and no healthy snapshot is available. "
                     "Stopping to avoid poisoning replay and metrics."
                 )
-            if not check_model_health(self.model, f"Task {task_id} restored-start"):
+            if not check_model_health(self.model, f"Task {self._task_label(task_id)} restored-start"):
                 raise RuntimeError(
-                    f"Model remains corrupted after restore attempt before Task {task_id}."
+                    f"Model remains corrupted after restore attempt before Task {self._task_label(task_id)}."
                 )
         
         task_start_time = time.time()
@@ -1148,7 +1153,7 @@ class ContinualLearner:
 
         if max_label_observed >= num_classes:
             raise RuntimeError(
-                f"Label range mismatch at task {task_id}: observed max label {max_label_observed}, "
+                f"Label range mismatch at task {self._task_label(task_id)}: observed max label {max_label_observed}, "
                 f"but classifier outputs only {num_classes} classes."
             )
         
@@ -1218,7 +1223,7 @@ class ContinualLearner:
         task_total_steps = max(1, int(self.epochs_per_task))
         task_progress_bar = tqdm(
             total=task_total_steps,
-            desc=f"Task {task_id} Training",
+            desc=f"Task {self._task_label(task_id)} Training",
             unit='epoch',
             bar_format='{l_bar}{bar:30}{r_bar}{bar:-10b}'
         )
@@ -1277,7 +1282,7 @@ class ContinualLearner:
             )
             rollback_snapshot = self._snapshot_model_for_rollback()
             if pre_prune_mca is not None:
-                print(f"Pre-prune MCA estimate (task {task_id}): {pre_prune_mca:.4f}")
+                print(f"Pre-prune MCA estimate (task {self._task_label(task_id)}): {pre_prune_mca:.4f}")
 
         prune_applied = self._auto_prune_network_end_of_task(task_id, train_loader=train_loader)
         self._post_prune_recovery(task_id, train_loader, prune_applied)
@@ -1297,7 +1302,7 @@ class ContinualLearner:
         # metrics and only record AMCA to avoid a redundant full validation pass.
         if not prune_applied and last_eval_snapshot is not None:
             print(
-                f"\nFinal evaluation after task {task_id}: "
+                f"\nFinal evaluation after task {self._task_label(task_id)}: "
                 "reusing latest epoch metrics (no post-train model change)."
             )
             if self.use_amca and self.amca_tester:
@@ -1319,7 +1324,7 @@ class ContinualLearner:
                     print(f"AMCA error: {e}")
                     self.amca_tester.mean_class_accuracies.append(0.0)
         else:
-            print(f"\nFinal evaluation after task {task_id}:")
+            print(f"\nFinal evaluation after task {self._task_label(task_id)}:")
             self._evaluate_and_update_metrics(
                 task_id,
                 cached_test_loader,
@@ -1331,7 +1336,7 @@ class ContinualLearner:
         task_elapsed_time = time.time() - task_start_time
         self.metrics.record_task_time(task_id, task_elapsed_time)
         self.metrics.update_compute_cost(task_elapsed_time)
-        print(f"\nTask {task_id} compute time: {task_elapsed_time:.2f} seconds\n")
+        print(f"\nTask {self._task_label(task_id)} compute time: {task_elapsed_time:.2f} seconds\n")
         
         self.metrics.print_summary(task_id)
         if self.use_amca and self.amca_tester is not None:
@@ -1339,7 +1344,7 @@ class ContinualLearner:
 
         if self._model_has_nonfinite_parameters():
             print(
-                f"[WARNING] Task {task_id} ended with non-finite parameters; "
+                f"[WARNING] Task {self._task_label(task_id)} ended with non-finite parameters; "
                 "last-good snapshot not updated."
             )
         else:
@@ -1410,7 +1415,7 @@ class ContinualLearner:
             weight_count = int(criterion.weights.numel())
             if weight_count != num_output_classes:
                 raise RuntimeError(
-                    f"Class weight mismatch at task {task_id}: criterion has {weight_count} weights "
+                    f"Class weight mismatch at task {self._task_label(task_id)}: criterion has {weight_count} weights "
                     f"but model outputs {num_output_classes} classes."
                 )
 
@@ -1589,12 +1594,12 @@ class ContinualLearner:
                     self.optimizer.zero_grad(set_to_none=True)
                     has_pending_grad = False
                     print(
-                        f"\n[WARNING] Non-finite loss at task {task_id}, epoch {epoch + 1}, "
+                        f"\n[WARNING] Non-finite loss at task {self._task_label(task_id)}, epoch {epoch + 1}, "
                         f"batch {batch_idx}; skipped ({nonfinite_batches}/{max_nonfinite_batches})"
                     )
                     if nonfinite_batches >= max_nonfinite_batches:
                         raise RuntimeError(
-                            f"Too many non-finite losses in task {task_id}, epoch {epoch + 1}. "
+                            f"Too many non-finite losses in task {self._task_label(task_id)}, epoch {epoch + 1}. "
                             "Stopping to prevent model corruption."
                         )
                     continue
@@ -1656,7 +1661,7 @@ class ContinualLearner:
             print("No samples collected for replay buffer!")
             return
 
-        print(f"\nUpdating replay buffer for task {task_id} (from memory)")
+        print(f"\nUpdating replay buffer for task {self._task_label(task_id)} (from memory)")
         
         all_images = torch.cat(collected_data['images'], dim=0)
         all_labels = torch.cat(collected_data['labels'], dim=0)
@@ -1668,7 +1673,7 @@ class ContinualLearner:
             finite_count = int(finite_logits_mask.sum().item())
             if finite_count <= 0:
                 print(
-                    f"[WARNING] Replay update skipped for task {task_id}: "
+                    f"[WARNING] Replay update skipped for task {self._task_label(task_id)}: "
                     "all cached logits are non-finite."
                 )
                 return
@@ -1676,7 +1681,7 @@ class ContinualLearner:
                 dropped = int(all_logits.size(0) - finite_count)
                 print(
                     f"[WARNING] Dropping {dropped} non-finite replay candidates "
-                    f"for task {task_id}."
+                    f"for task {self._task_label(task_id)}."
                 )
                 all_images = all_images[finite_logits_mask]
                 all_labels = all_labels[finite_logits_mask]
@@ -1707,7 +1712,7 @@ class ContinualLearner:
             finite_count = int(finite_soft_mask.sum().item())
             if finite_count <= 0:
                 print(
-                    f"[WARNING] Replay update skipped for task {task_id}: "
+                    f"[WARNING] Replay update skipped for task {self._task_label(task_id)}: "
                     "all computed soft targets are non-finite."
                 )
                 return
@@ -1715,7 +1720,7 @@ class ContinualLearner:
                 dropped = int(soft_targets.size(0) - finite_count)
                 print(
                     f"[WARNING] Dropping {dropped} non-finite fallback replay candidates "
-                    f"for task {task_id}."
+                    f"for task {self._task_label(task_id)}."
                 )
                 all_images = all_images[finite_soft_mask]
                 all_labels = all_labels[finite_soft_mask]
@@ -1747,11 +1752,11 @@ class ContinualLearner:
         if not replay_cfg.get('auto_distill_end_of_task', True):
             return
         if len(self.replay_buffer) == 0:
-            print(f"Replay buffer empty after task {task_id}; skipping auto-distillation")
+            print(f"Replay buffer empty after task {self._task_label(task_id)}; skipping auto-distillation")
             return
         if self._model_has_nonfinite_parameters():
             print(
-                f"[WARNING] Skipping auto-distillation after task {task_id}: "
+                f"[WARNING] Skipping auto-distillation after task {self._task_label(task_id)}: "
                 "model has non-finite parameters."
             )
             return
@@ -1774,9 +1779,9 @@ class ContinualLearner:
                     target_size=target_size,
                     device=self.device
                 )
-            print(f"Auto-distilled replay buffer at end of task {task_id}")
+            print(f"Auto-distilled replay buffer at end of task {self._task_label(task_id)}")
         except Exception as e:
-            print(f"[WARNING] Auto replay-buffer distillation failed after task {task_id}: {e}")
+            print(f"[WARNING] Auto replay-buffer distillation failed after task {self._task_label(task_id)}: {e}")
 
     def _post_prune_recovery(self, task_id: int, train_loader: DataLoader, prune_applied: bool):
         """Run a short recovery fine-tuning phase after pruning to stabilize accuracy."""
@@ -1797,7 +1802,7 @@ class ContinualLearner:
         if self.prune_recovery_epochs <= 0:
             return
 
-        print(f"\n--- Post-Prune Recovery (Task {task_id}) ---")
+        print(f"\n--- Post-Prune Recovery (Task {self._task_label(task_id)}) ---")
         print(
             f"Recovery epochs={self.prune_recovery_epochs}, "
             f"learning_rate={recovery_lr:.6g}"
@@ -1987,14 +1992,14 @@ class ContinualLearner:
         modules_to_prune = self._collect_prunable_dense_parameters()
         if not modules_to_prune:
             print(
-                f"No eligible whole-model parameters found at task {task_id} "
+                f"No eligible whole-model parameters found at task {self._task_label(task_id)} "
                 "(current-task adapters are protected)."
             )
             return False
 
         prunable_effective = self._count_prunable_dense_effective_params(modules_to_prune)
         if prunable_effective <= 0:
-            print(f"No active dense parameters available to prune at task {task_id}")
+            print(f"No active dense parameters available to prune at task {self._task_label(task_id)}")
             return False
 
         prune_amount = self._resolve_prune_amount(
@@ -2006,7 +2011,7 @@ class ContinualLearner:
 
         example_inputs = self._get_pruning_example_input(train_loader=train_loader)
         if example_inputs is None:
-            print(f"[WARNING] No valid example input available for structural pruning at task {task_id}")
+            print(f"[WARNING] No valid example input available for structural pruning at task {self._task_label(task_id)}")
             return False
 
         ignored_layers = self._collect_structural_pruning_ignored_layers()
@@ -2016,7 +2021,7 @@ class ContinualLearner:
         try:
             pre_prune_snapshot = copy.deepcopy(self.model).cpu()
         except Exception as e:
-            print(f"[WARNING] Could not snapshot model before structural pruning at task {task_id}: {e}")
+            print(f"[WARNING] Could not snapshot model before structural pruning at task {self._task_label(task_id)}: {e}")
 
         try:
             self.model.eval()
@@ -2039,7 +2044,7 @@ class ContinualLearner:
             except Exception as prune_error:
                 if importance_name == 'taylor':
                     print(
-                        f"[WARNING] Taylor structural pruning failed at task {task_id}: {prune_error}. "
+                        f"[WARNING] Taylor structural pruning failed at task {self._task_label(task_id)}: {prune_error}. "
                         "Retrying once with magnitude importance."
                     )
 
@@ -2098,7 +2103,7 @@ class ContinualLearner:
             self.model.zero_grad(set_to_none=True)
 
             print(
-                f"Auto-structural-pruned whole model at end of task {task_id}: "
+                f"Auto-structural-pruned whole model at end of task {self._task_label(task_id)}: "
                 f"amount={prune_amount:.4f}, ignored_layers={len(ignored_layers)}, "
                 f"importance={importance_name}, "
                 f"effective params {before_effective:,} -> {after_effective:,}, "
@@ -2116,14 +2121,14 @@ class ContinualLearner:
                     self.train_model = self.model
                     print(
                         f"[WARNING] Restored pre-prune snapshot after structural pruning failure "
-                        f"at task {task_id}."
+                        f"at task {self._task_label(task_id)}."
                     )
                 except Exception as restore_error:
                     print(
-                        f"[WARNING] Could not restore pre-prune snapshot at task {task_id}: "
+                        f"[WARNING] Could not restore pre-prune snapshot at task {self._task_label(task_id)}: "
                         f"{restore_error}"
                     )
-            print(f"[WARNING] Structural whole-model pruning failed after task {task_id}: {e}")
+            print(f"[WARNING] Structural whole-model pruning failed after task {self._task_label(task_id)}: {e}")
             return False
 
     def _auto_prune_network_end_of_task(
@@ -2137,20 +2142,20 @@ class ContinualLearner:
 
         if task_id < self.pruning_warmup_tasks:
             print(
-                f"Skipping pruning at task {task_id}: warmup active "
+                f"Skipping pruning at task {self._task_label(task_id)}: warmup active "
                 f"(warmup_tasks={self.pruning_warmup_tasks})"
             )
             return False
 
         if not self._is_pruning_task(task_id):
             print(
-                f"Skipping pruning at task {task_id}: interval active "
+                f"Skipping pruning at task {self._task_label(task_id)}: interval active "
                 f"(interval_tasks={self.pruning_interval_tasks})"
             )
             return False
 
         if self.pruning_scope == 'hybrid':
-            print(f"\n--- Executing HYBRID pruning at task {task_id} ---")
+            print(f"\n--- Executing HYBRID pruning at task {self._task_label(task_id)} ---")
 
             original_scope = self.pruning_scope
             original_method = self.pruning_method
@@ -2196,14 +2201,14 @@ class ContinualLearner:
             modules_to_prune = self._collect_prunable_dense_parameters()
             if not modules_to_prune:
                 print(
-                    f"No eligible whole-model parameters found at task {task_id} "
+                    f"No eligible whole-model parameters found at task {self._task_label(task_id)} "
                     "(current-task adapters are protected)."
                 )
                 return False
 
             prunable_effective = self._count_prunable_dense_effective_params(modules_to_prune)
             if prunable_effective <= 0:
-                print(f"No active dense parameters available to prune at task {task_id}")
+                print(f"No active dense parameters available to prune at task {self._task_label(task_id)}")
                 return False
 
             prune_amount = self._resolve_prune_amount(
@@ -2251,7 +2256,7 @@ class ContinualLearner:
                 })
 
                 print(
-                    f"Auto-pruned whole model at end of task {task_id}: "
+                    f"Auto-pruned whole model at end of task {self._task_label(task_id)}: "
                     f"amount={prune_amount:.4f}, modules={len(modules_to_prune)}, "
                     f"effective params {before_effective:,} -> {after_effective:,} "
                     f"(freed {pruned_now:,})"
@@ -2262,7 +2267,7 @@ class ContinualLearner:
                     modules_to_prune,
                     keep_existing_reparam=preexisting_reparam
                 )
-                print(f"[WARNING] Whole-model pruning failed after task {task_id}: {e}")
+                print(f"[WARNING] Whole-model pruning failed after task {self._task_label(task_id)}: {e}")
                 return False
 
         if self.pruning_scope not in {'older_adapters_only', 'all_adapters'}:
@@ -2301,7 +2306,7 @@ class ContinualLearner:
             candidates = self._collect_prunable_adapter_candidates()
             if not candidates:
                 print(
-                    f"No removable adapters found for scope '{self.pruning_scope}' at task {task_id} "
+                    f"No removable adapters found for scope '{self.pruning_scope}' at task {self._task_label(task_id)} "
                     "(current-task adapters are protected)."
                 )
                 return False
@@ -2309,7 +2314,7 @@ class ContinualLearner:
             before_effective = self._get_effective_model_params()
             total_candidate_params = int(sum(c['adapter_params'] for c in candidates))
             if total_candidate_params <= 0:
-                print(f"No removable adapter parameters available at task {task_id}")
+                print(f"No removable adapter parameters available at task {self._task_label(task_id)}")
                 return False
 
             prune_amount = self._resolve_prune_amount(
@@ -2333,7 +2338,7 @@ class ContinualLearner:
                 removed_param_budget += int(candidate['adapter_params'])
 
             if not selected:
-                print(f"No adapters selected for pruning at task {task_id}")
+                print(f"No adapters selected for pruning at task {self._task_label(task_id)}")
                 return False
 
             try:
@@ -2388,7 +2393,7 @@ class ContinualLearner:
                 })
 
                 print(
-                    f"Auto-pruned at end of task {task_id}: "
+                    f"Auto-pruned at end of task {self._task_label(task_id)}: "
                     f"scope={self.pruning_scope}, amount={prune_amount:.4f}, "
                     f"effective params {before_effective:,} -> {after_effective:,} "
                     f"(freed {pruned_now:,}, removed_adapters={removed_adapters}, "
@@ -2396,7 +2401,7 @@ class ContinualLearner:
                 )
                 return True
             except Exception as e:
-                print(f"[WARNING] Auto network pruning failed after task {task_id}: {e}")
+                print(f"[WARNING] Auto network pruning failed after task {self._task_label(task_id)}: {e}")
                 return False
         finally:
             for param, original_requires_grad in adapter_grad_state:

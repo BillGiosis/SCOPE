@@ -227,7 +227,7 @@ class BDDCBenchmark:
 
         datasets = self._train_sets if train else self._eval_sets
         if task_id >= len(datasets):
-            raise ValueError(f"Task {task_id} not available. Only {len(datasets)} tasks.")
+            raise ValueError(f"Task {task_id + 1} not available. Only {len(datasets)} tasks.")
 
         dataset = datasets[task_id]
         sampler = None
@@ -271,13 +271,13 @@ class BDDCBenchmark:
 
     def get_task_info(self, task_id: int) -> Dict:
         if task_id >= len(self._train_sets):
-            raise ValueError(f"Task {task_id} not available.")
+            raise ValueError(f"Task {task_id + 1} not available.")
 
         train_dataset = self._train_sets[task_id]
         class_dist = np.bincount(train_dataset.targets, minlength=self.num_classes).tolist()
         return {
-            'task_id': task_id,
-            'task_name': self.task_names[task_id] if task_id < len(self.task_names) else f'task_{task_id}',
+            'task_id': task_id + 1,
+            'task_name': self.task_names[task_id] if task_id < len(self.task_names) else f'task_{task_id + 1}',
             'num_train_samples': len(train_dataset),
             'num_test_samples': len(self._eval_sets[task_id]) if task_id < len(self._eval_sets) else 0,
             'num_classes': self.num_classes,
