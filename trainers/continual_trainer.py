@@ -447,6 +447,12 @@ class ContinualLearner:
                 for adapter in adapters:
                     yield layer_name, block_idx, adapter
 
+    def _apply_adapter_training_modes(self):
+        """Keep frozen historical adapters, including their BN buffers, fixed."""
+        for _, _, adapter in self._iter_adapters():
+            is_new_adapter = id(adapter) in self.current_task_new_adapter_ids
+            adapter.train(bool(is_new_adapter))
+
     def _get_pruning_example_input(self, train_loader: Optional[DataLoader] = None) -> Optional[torch.Tensor]:
         """Build example input for graph-based structural pruning."""
         if train_loader is not None:
@@ -471,8 +477,9 @@ class ContinualLearner:
                 print(f"[WARNING] Could not derive pruning example input from loader: {e}")
 
         try:
-            # CLAD-C image fallback; normal path uses one sample from train_loader.
-            shape = (1, 3, 64, 64)
+            # Normal path uses one sample from train_loader; fallback matches benchmark defaults.
+            benchmark_name = str(self.config.get('benchmark', {}).get('name', '')).strip().lower()
+            shape = (1, 3, 64, 64) if benchmark_name == 'clad-c' else (1, 3, 224, 224)
             example = torch.randn(*shape, device=self.device)
             if self.device == 'cuda':
                 example = example.contiguous(memory_format=torch.channels_last)
@@ -1108,6 +1115,7 @@ class ContinualLearner:
             f"trainable_new={trainable_new_adapters}, "
             f"frozen_historical={frozen_historical_adapters}"
         )
+        self._apply_adapter_training_modes()
 
         self._prepare_training_model_for_task(task_id)
         
@@ -1157,9 +1165,8 @@ class ContinualLearner:
                 f"but classifier outputs only {num_classes} classes."
             )
         
-        safe_counts = [c if c > 0 else 1 for c in class_counts]
         self.criterion = ClassBalancedLoss(
-            class_counts=safe_counts, 
+            class_counts=class_counts,
             beta=self.config['training'].get('cb_beta', 0.9999)
         ).to(self.device)
         
@@ -1363,6 +1370,7 @@ class ContinualLearner:
         from tqdm import tqdm
         
         self.train_model.train()
+        self._apply_adapter_training_modes()
 
         total_loss = 0.0
         correct = 0
@@ -1571,10 +1579,7 @@ class ContinualLearner:
                         with torch.amp.autocast('cuda', enabled=self.use_amp):
                             r_out = train_forward(r_imgs)
 
-                    if has_class_balanced_loss:
-                        loss += 0.5 * criterion(r_out.float(), r_lbls)
-                    else:
-                        loss += 0.5 * F.cross_entropy(r_out.float(), r_lbls)
+                    loss += 0.5 * F.cross_entropy(r_out.float(), r_lbls)
 
                     if replay_batch['soft_targets'] is not None:
                         soft_targets = replay_batch['soft_targets'].to(self.device, non_blocking=True).float()
@@ -2079,8 +2084,9 @@ class ContinualLearner:
 
             after_effective = self._get_effective_model_params()
             after_total = int(self.model.get_num_parameters()) if hasattr(self.model, 'get_num_parameters') else int(sum(p.numel() for p in self.model.parameters()))
-            pruned_now = max(0, before_effective - after_effective)
-            total_removed = max(0, before_total - after_total)
+            capacity_before = int(before_total)
+            capacity_after = int(after_total)
+            pruned_now = max(0, capacity_before - capacity_after)
 
             self.pruning_history.append({
                 'task_id': int(task_id),
@@ -2088,12 +2094,13 @@ class ContinualLearner:
                 'method': 'structural',
                 'amount': float(prune_amount),
                 'importance': importance_name,
+                'capacity_params_before': int(capacity_before),
+                'capacity_params_after': int(capacity_after),
                 'effective_params_before': int(before_effective),
                 'effective_params_after': int(after_effective),
                 'pruned_params': int(pruned_now),
                 'total_params_before': int(before_total),
                 'total_params_after': int(after_total),
-                'total_removed_params': int(total_removed),
                 'ignored_layers': int(len(ignored_layers)),
                 'example_input_shape': list(example_inputs.shape),
                 'taylor_replay_batches': int(self.last_taylor_gradient_stats.get('replay_batches', 0)),
@@ -2106,9 +2113,8 @@ class ContinualLearner:
                 f"Auto-structural-pruned whole model at end of task {self._task_label(task_id)}: "
                 f"amount={prune_amount:.4f}, ignored_layers={len(ignored_layers)}, "
                 f"importance={importance_name}, "
-                f"effective params {before_effective:,} -> {after_effective:,}, "
-                f"total params {before_total:,} -> {after_total:,} "
-                f"(freed {pruned_now:,} effective / {total_removed:,} physical)"
+                f"capacity params {capacity_before:,} -> {capacity_after:,} "
+                f"(freed {pruned_now:,})"
             )
             return True
         except Exception as e:
@@ -2241,13 +2247,17 @@ class ContinualLearner:
                 )
 
                 after_effective = self._get_effective_model_params()
-                pruned_now = max(0, before_effective - after_effective)
+                capacity_before = int(before_effective)
+                capacity_after = int(after_effective)
+                pruned_now = max(0, capacity_before - capacity_after)
 
                 self.pruning_history.append({
                     'task_id': int(task_id),
                     'scope': self.pruning_scope,
                     'method': 'unstructured',
                     'amount': float(prune_amount),
+                    'capacity_params_before': int(capacity_before),
+                    'capacity_params_after': int(capacity_after),
                     'effective_params_before': int(before_effective),
                     'effective_params_after': int(after_effective),
                     'pruned_params': int(pruned_now),
@@ -2258,7 +2268,7 @@ class ContinualLearner:
                 print(
                     f"Auto-pruned whole model at end of task {self._task_label(task_id)}: "
                     f"amount={prune_amount:.4f}, modules={len(modules_to_prune)}, "
-                    f"effective params {before_effective:,} -> {after_effective:,} "
+                    f"capacity params {capacity_before:,} -> {capacity_after:,} "
                     f"(freed {pruned_now:,})"
                 )
                 return True
@@ -2371,7 +2381,9 @@ class ContinualLearner:
                     block.adapters = nn.ModuleList(keep_adapters)
 
                 after_effective = self._get_effective_model_params()
-                pruned_now = max(0, before_effective - after_effective)
+                capacity_before = int(before_effective)
+                capacity_after = int(after_effective)
+                pruned_now = max(0, capacity_before - capacity_after)
 
                 # Keep tracking set aligned after structural deletions.
                 alive_adapter_ids = {id(adapter) for _, _, adapter in self._iter_adapters()}
@@ -2383,6 +2395,8 @@ class ContinualLearner:
                     'method': 'adapter_delete',
                     'amount': float(prune_amount),
                     'importance': ('taylor' if self.pruning_importance == 'taylor' else 'magnitude'),
+                    'capacity_params_before': int(capacity_before),
+                    'capacity_params_after': int(capacity_after),
                     'effective_params_before': int(before_effective),
                     'effective_params_after': int(after_effective),
                     'pruned_params': int(pruned_now),
@@ -2395,7 +2409,7 @@ class ContinualLearner:
                 print(
                     f"Auto-pruned at end of task {self._task_label(task_id)}: "
                     f"scope={self.pruning_scope}, amount={prune_amount:.4f}, "
-                    f"effective params {before_effective:,} -> {after_effective:,} "
+                    f"capacity params {capacity_before:,} -> {capacity_after:,} "
                     f"(freed {pruned_now:,}, removed_adapters={removed_adapters}, "
                     f"removed_params={removed_params:,})"
                 )
@@ -2606,7 +2620,7 @@ class ContinualLearner:
 
             if in_channels == out_channels and stride == 1:
                 hidden = max(1, in_channels // 16)
-                delta += (in_channels * hidden) + (hidden * in_channels)
+                delta += (in_channels * hidden) + (hidden * in_channels) + (2 * in_channels)
 
         return int(delta)
 

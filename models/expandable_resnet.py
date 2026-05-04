@@ -14,12 +14,13 @@ class AdapterLayer(nn.Module):
         self.down = nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False)
         self.relu = nn.ReLU(inplace=True)
         self.up = nn.Conv2d(hidden_dim, in_channels, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(in_channels)
         
         nn.init.kaiming_normal_(self.down.weight, mode='fan_out', nonlinearity='relu')
         nn.init.zeros_(self.up.weight)
 
     def forward(self, x):
-        return self.up(self.relu(self.down(x)))
+        return self.bn(self.up(self.relu(self.down(x))))
 
 
 class ExpandableBottleneck(nn.Module):
@@ -156,11 +157,29 @@ class ExpandableResNet(nn.Module):
         self.expansion_history = []
         
     def add_task_head(self, num_classes: int):
+        num_classes = int(num_classes)
         if self.fc is None:
             self.fc = nn.Linear(self.feature_dim, num_classes)
             self.num_classes = num_classes
             if next(self.parameters()).is_cuda:
                 self.fc = self.fc.cuda()
+            return
+
+        current_classes = int(self.fc.out_features)
+        if current_classes == num_classes:
+            self.num_classes = num_classes
+            return
+
+        device = self.fc.weight.device
+        new_fc = nn.Linear(self.feature_dim, num_classes).to(device)
+        with torch.no_grad():
+            copy_classes = min(current_classes, num_classes)
+            new_fc.weight[:copy_classes].copy_(self.fc.weight[:copy_classes])
+            if self.fc.bias is not None and new_fc.bias is not None:
+                new_fc.bias[:copy_classes].copy_(self.fc.bias[:copy_classes])
+
+        self.fc = new_fc
+        self.num_classes = num_classes
                 
     def expand_layer(self, layer_name: str):
         if layer_name not in ['layer1', 'layer2', 'layer3', 'layer4']:
@@ -199,11 +218,6 @@ class ExpandableResNet(nn.Module):
         return x
     
     def forward(self, x):
-        # Force float32 for interpolation to avoid AMP errors
-        if x.shape[-1] < 224:
-            x = x.float() 
-            x = torch.nn.functional.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
-            
         features = self.get_features(x)
         if self.fc is None:
             raise ValueError("Classifier not initialized. Call add_task_head first.")

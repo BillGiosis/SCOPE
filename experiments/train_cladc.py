@@ -397,9 +397,11 @@ def main(args):
             importance = entry.get('importance', 'n/a')
             rollback_flag = entry.get('rolled_back', False)
             rollback_suffix = ', rollback=applied' if rollback_flag else ''
+            capacity_before = entry.get('capacity_params_before', entry.get('effective_params_before', 0))
+            capacity_after = entry.get('capacity_params_after', entry.get('effective_params_after', 0))
             f.write(
                 f"  Task {task_id}: pruned={entry['pruned_params']:,}, "
-                f"effective={entry['effective_params_before']:,}->{entry['effective_params_after']:,}, "
+                f"capacity={capacity_before:,}->{capacity_after:,}, "
                 f"amount={entry['amount']:.4f}, scope={entry['scope']}, method={method}, "
                 f"importance={importance}{rollback_suffix}\n"
             )
