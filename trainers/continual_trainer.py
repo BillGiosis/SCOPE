@@ -111,7 +111,6 @@ class ContinualLearner:
         self.pruning_amount = float(pruning_cfg.get('amount', 0.0))
         self.pruning_scope = str(pruning_cfg.get('scope', 'whole_model')).strip().lower()
         self.pruning_method = str(pruning_cfg.get('method', 'structural')).strip().lower()
-        self.pruning_interval_tasks = max(1, int(pruning_cfg.get('interval_tasks', 1)))
         self.pruning_importance = str(pruning_cfg.get('importance', 'magnitude')).strip().lower()
         self.pruning_use_replay_for_taylor = bool(pruning_cfg.get('use_replay_for_taylor', True))
         self.pruning_taylor_replay_batches = max(0, int(pruning_cfg.get('taylor_replay_batches', 2)))
@@ -126,8 +125,6 @@ class ContinualLearner:
             )
         )
         self.pruning_warmup_tasks = max(0, int(pruning_cfg.get('warmup_tasks', 2)))
-        self.pruning_min_amount = float(pruning_cfg.get('min_amount', 0.0))
-        self.pruning_max_amount = float(pruning_cfg.get('max_amount', self.pruning_amount))
         hybrid_cfg = pruning_cfg.get('hybrid', {})
         self.hybrid_whole_model_amount = float(hybrid_cfg.get('whole_model_amount', 0.01))
         self.hybrid_adapter_amount = float(hybrid_cfg.get('adapter_amount', 0.20))
@@ -180,12 +177,8 @@ class ContinualLearner:
         self.prune_recovery_lr_scale = float(recovery_cfg.get('learning_rate_scale', 0.2))
 
         self.pruning_amount = min(max(self.pruning_amount, 0.0), 1.0)
-        self.pruning_min_amount = min(max(self.pruning_min_amount, 0.0), 1.0)
-        self.pruning_max_amount = min(max(self.pruning_max_amount, 0.0), 1.0)
         self.hybrid_whole_model_amount = min(max(self.hybrid_whole_model_amount, 0.0), 1.0)
         self.hybrid_adapter_amount = min(max(self.hybrid_adapter_amount, 0.0), 1.0)
-        if self.pruning_max_amount < self.pruning_min_amount:
-            self.pruning_max_amount = self.pruning_min_amount
         if self.hybrid_adapter_scope not in {'older_adapters_only', 'all_adapters'}:
             print(
                 f"[WARNING] Unsupported network_pruning.hybrid.adapter_scope='{self.hybrid_adapter_scope}'. "
@@ -229,13 +222,10 @@ class ContinualLearner:
         return int(task_id) + 1
 
     def _is_pruning_task(self, task_id: int) -> bool:
-        """Return whether pruning should run for this task id under warmup/interval rules."""
+        """Return whether pruning should run for this task id after warmup."""
         if not self.pruning_enabled:
             return False
-        if task_id < self.pruning_warmup_tasks:
-            return False
-        offset = task_id - self.pruning_warmup_tasks
-        return (offset % self.pruning_interval_tasks) == 0
+        return task_id >= self.pruning_warmup_tasks
 
     def _resolve_expansion_layers(self, strategy: str) -> List[str]:
         """Resolve configured strategy into an expansion layer schedule."""
@@ -1646,6 +1636,8 @@ class ContinualLearner:
                     pbar.set_postfix({'loss': f'{total_loss/(batch_idx+1):.4f}', 'acc': f'{100.*correct/total:.2f}%'})
         
         if has_pending_grad:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
@@ -1694,23 +1686,28 @@ class ContinualLearner:
             soft_targets = F.softmax(all_logits.float() / self.replay_buffer.distillation_temp, dim=1)
         else:
             print("Computing logits (fallback)")
+            module_training_modes = {module: module.training for module in self.model.modules()}
             self.model.eval()
             soft_targets_list = []
             batch_size = 128
             
-            with torch.no_grad():
-                for i in range(0, len(all_images), batch_size):
-                    batch_imgs = all_images[i:i+batch_size]
-                    if self.device == 'cuda':
-                        batch_imgs = batch_imgs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
-                    else:
-                        batch_imgs = batch_imgs.to(self.device)
-                    
-                    with torch.amp.autocast('cuda', enabled=self.use_amp):
-                        outputs = self.model(batch_imgs)
-                        soft = F.softmax(outputs.float() / self.replay_buffer.distillation_temp, dim=1)
-                    
-                    soft_targets_list.append(soft.cpu())
+            try:
+                with torch.no_grad():
+                    for i in range(0, len(all_images), batch_size):
+                        batch_imgs = all_images[i:i+batch_size]
+                        if self.device == 'cuda':
+                            batch_imgs = batch_imgs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                        else:
+                            batch_imgs = batch_imgs.to(self.device)
+
+                        with torch.amp.autocast('cuda', enabled=self.use_amp):
+                            outputs = self.model(batch_imgs)
+                            soft = F.softmax(outputs.float() / self.replay_buffer.distillation_temp, dim=1)
+
+                        soft_targets_list.append(soft.cpu())
+            finally:
+                for module, was_training in module_training_modes.items():
+                    module.train(was_training)
             soft_targets = torch.cat(soft_targets_list, dim=0)
 
             finite_soft_mask = torch.isfinite(soft_targets).all(dim=1)
@@ -2137,6 +2134,66 @@ class ContinualLearner:
             print(f"[WARNING] Structural whole-model pruning failed after task {self._task_label(task_id)}: {e}")
             return False
 
+    @staticmethod
+    def _combine_hybrid_pruning_entries(task_id: int, entries: List[Dict]) -> Dict:
+        """Collapse the two internal hybrid prune steps into one task-level record."""
+        if not entries:
+            return {
+                'task_id': int(task_id),
+                'scope': 'hybrid',
+                'method': 'hybrid',
+                'amount': 0.0,
+                'pruned_params': 0
+            }
+
+        first = entries[0]
+        last = entries[-1]
+        whole_model_entries = [entry for entry in entries if entry.get('scope') == 'whole_model']
+        adapter_entries = [
+            entry for entry in entries
+            if entry.get('scope') in {'older_adapters_only', 'all_adapters'}
+        ]
+        importances = sorted({
+            str(entry.get('importance'))
+            for entry in entries
+            if entry.get('importance') not in {None, 'n/a'}
+        })
+
+        combined = {
+            'task_id': int(task_id),
+            'scope': 'hybrid',
+            'method': 'hybrid',
+            'amount': float(last.get('amount', 0.0)),
+            'importance': '+'.join(importances) if importances else 'n/a',
+            'capacity_params_before': int(first.get('capacity_params_before', first.get('effective_params_before', 0))),
+            'capacity_params_after': int(last.get('capacity_params_after', last.get('effective_params_after', 0))),
+            'effective_params_before': int(first.get('effective_params_before', first.get('capacity_params_before', 0))),
+            'effective_params_after': int(last.get('effective_params_after', last.get('capacity_params_after', 0))),
+            'pruned_params': int(sum(int(entry.get('pruned_params', 0)) for entry in entries)),
+            'components': entries,
+            'component_count': int(len(entries)),
+            'whole_model_pruned_params': int(sum(int(entry.get('pruned_params', 0)) for entry in whole_model_entries)),
+            'adapter_pruned_params': int(sum(int(entry.get('pruned_params', 0)) for entry in adapter_entries)),
+            'removed_adapters': int(sum(int(entry.get('removed_adapters', 0)) for entry in adapter_entries)),
+            'whole_model_amount': float(whole_model_entries[-1].get('amount', 0.0)) if whole_model_entries else 0.0,
+            'adapter_amount': float(adapter_entries[-1].get('amount', 0.0)) if adapter_entries else 0.0,
+            'adapter_scope': str(adapter_entries[-1].get('scope', 'n/a')) if adapter_entries else 'n/a',
+        }
+
+        for key in (
+            'taylor_replay_batches',
+            'taylor_train_batches',
+            'rollback_pre_mca',
+            'rollback_post_mca',
+            'rollback_mca_drop',
+            'rollback_threshold',
+        ):
+            values = [entry.get(key) for entry in entries if key in entry]
+            if values:
+                combined[key] = values[-1]
+
+        return combined
+
     def _auto_prune_network_end_of_task(
         self,
         task_id: int,
@@ -2153,19 +2210,13 @@ class ContinualLearner:
             )
             return False
 
-        if not self._is_pruning_task(task_id):
-            print(
-                f"Skipping pruning at task {self._task_label(task_id)}: interval active "
-                f"(interval_tasks={self.pruning_interval_tasks})"
-            )
-            return False
-
         if self.pruning_scope == 'hybrid':
             print(f"\n--- Executing HYBRID pruning at task {self._task_label(task_id)} ---")
 
             original_scope = self.pruning_scope
             original_method = self.pruning_method
             original_amount = self.pruning_amount
+            history_start = len(self.pruning_history)
 
             whole_model_success = False
             adapter_success = False
@@ -2194,6 +2245,12 @@ class ContinualLearner:
                 self.pruning_scope = original_scope
                 self.pruning_method = original_method
                 self.pruning_amount = original_amount
+
+            new_entries = self.pruning_history[history_start:]
+            if new_entries:
+                combined_entry = self._combine_hybrid_pruning_entries(task_id, new_entries)
+                del self.pruning_history[history_start:]
+                self.pruning_history.append(combined_entry)
 
             return bool(whole_model_success or adapter_success)
 
@@ -2618,9 +2675,14 @@ class ContinualLearner:
             if isinstance(stride, tuple):
                 stride = stride[0]
 
-            if in_channels == out_channels and stride == 1:
-                hidden = max(1, in_channels // 16)
-                delta += (in_channels * hidden) + (hidden * in_channels) + (2 * in_channels)
+            adapt_downsample_blocks = bool(getattr(block, 'adapt_downsample_blocks', True))
+            if not adapt_downsample_blocks and (in_channels != out_channels or stride != 1):
+                continue
+
+            hidden = max(1, in_channels // 16)
+            delta += (in_channels * hidden) + (hidden * out_channels)
+            if bool(getattr(block, 'adapter_batch_norm', True)):
+                delta += 2 * out_channels
 
         return int(delta)
 

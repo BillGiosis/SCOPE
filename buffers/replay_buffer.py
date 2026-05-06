@@ -40,7 +40,7 @@ class ReplayBuffer:
     def _init_storage(self, img_shape: Tuple[int, ...], num_classes_soft: int = 0):
         img_dtype = torch.float16 if self.use_fp16 else torch.float32
         soft_dtype = torch.float16 if self.use_fp16 else torch.float32
-        do_pin = (self.storage_device == 'cpu')
+        do_pin = (self.storage_device == 'cpu' and torch.cuda.is_available())
         
         self.images = torch.empty((self.max_size, *img_shape), dtype=img_dtype, device=self.storage_device, pin_memory=do_pin)
         self.labels = torch.empty((self.max_size,), dtype=torch.long, device=self.storage_device, pin_memory=do_pin)
@@ -220,22 +220,27 @@ class ReplayBuffer:
         self.sampling_weights = None
 
         # Compute Importance
+        module_training_modes = {module: module.training for module in model.modules()}
         model.eval()
         importance_scores = torch.zeros(self.num_samples, device=self.storage_device)
         eval_batch_size = 256
-        
-        with torch.no_grad():
-            for i in range(0, self.num_samples, eval_batch_size):
-                end = min(i + eval_batch_size, self.num_samples)
-                batch_imgs = self.images[i:end].to(device, non_blocking=True)
-                
-                use_cuda_amp = str(device).startswith('cuda')
-                with torch.amp.autocast(device_type='cuda', enabled=use_cuda_amp):
-                    outputs = model(batch_imgs)
-                    probs = F.softmax(outputs, dim=1)
-                    entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=1)
-                
-                importance_scores[i:end] = entropy.to(self.storage_device)
+
+        try:
+            with torch.no_grad():
+                for i in range(0, self.num_samples, eval_batch_size):
+                    end = min(i + eval_batch_size, self.num_samples)
+                    batch_imgs = self.images[i:end].to(device, non_blocking=True)
+
+                    use_cuda_amp = str(device).startswith('cuda')
+                    with torch.amp.autocast(device_type='cuda', enabled=use_cuda_amp):
+                        outputs = model(batch_imgs)
+                        probs = F.softmax(outputs, dim=1)
+                        entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=1)
+
+                    importance_scores[i:end] = entropy.to(self.storage_device)
+        finally:
+            for module, was_training in module_training_modes.items():
+                module.train(was_training)
 
         # Select Indices
         sorted_indices = torch.argsort(importance_scores, descending=True)

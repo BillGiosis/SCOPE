@@ -89,8 +89,7 @@ class BDDCBenchmark:
         num_workers: int = 8,
         prefetch_factor: int = 2,
         pin_memory: bool = True,
-        eval_split: str = 'val',
-        use_weighted_sampler: bool = True
+        eval_split: str = 'val'
     ):
         self.root_dir = Path(root_dir)
         self.manifest_root = self.root_dir / 'manifests'
@@ -99,7 +98,6 @@ class BDDCBenchmark:
         self.prefetch_factor = prefetch_factor
         self.pin_memory = pin_memory
         self.eval_split = str(eval_split).strip().lower()
-        self.use_weighted_sampler = bool(use_weighted_sampler)
 
         self.train_transform = transforms.Compose([
             transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BILINEAR),
@@ -235,7 +233,7 @@ class BDDCBenchmark:
         sampler = None
         shuffle = train
 
-        if train and self.use_weighted_sampler and len(dataset) > 0:
+        if train and len(dataset) > 0:
             label_tensor = torch.as_tensor(dataset.targets, dtype=torch.long)
             class_counts = torch.bincount(label_tensor, minlength=self.num_classes)
             class_weights = torch.zeros_like(class_counts, dtype=torch.float32)
@@ -302,9 +300,5 @@ def create_bddc_benchmark(config: Dict) -> BDDCBenchmark:
         num_workers=data_loading_config.get('num_workers', 4),
         prefetch_factor=data_loading_config.get('prefetch_factor', 2),
         pin_memory=data_loading_config.get('pin_memory', True),
-        eval_split=benchmark_config.get('eval_split', 'val'),
-        use_weighted_sampler=training_config.get(
-            'use_weighted_sampler',
-            data_loading_config.get('use_weighted_sampler', True)
-        )
+        eval_split=benchmark_config.get('eval_split', 'val')
     )

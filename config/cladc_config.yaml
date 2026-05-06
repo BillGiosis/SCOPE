@@ -10,6 +10,11 @@ benchmark:
   # CLAD-C challenge rule used by the network expansion parameter budget
   max_params_ratio: 1.05  # 105% of initial model params
 
+model:
+  backbone: "resnet50d"
+  adapt_downsample_blocks: false  # If false, adapters are only added to same-shape stride-1 bottlenecks
+  adapter_batch_norm: false  # If false, adapters use Conv-ReLU-Conv without adapter BatchNorm
+
 training:
   batch_size: 10  # 10 as per CLAD-C challenge
   epochs_per_task: 70
@@ -47,11 +52,8 @@ network_expansion:
 
 network_pruning:
   enabled: true
-  amount: 0.05  # Maximum fraction pruned at task end (applied by scope)
+  amount: 0.05  # Used only when scope is not "hybrid"; hybrid uses the amounts below.
   warmup_tasks: 2  # Do not prune during first N tasks to protect early AMCA
-  interval_tasks: 1  # Run pruning every N tasks after warmup
-  min_amount: 0.02
-  max_amount: 0.15
   scope: "hybrid"  # Options: "whole_model", "older_adapters_only", "all_adapters", or "hybrid"
   # hybrid: gentle structural whole-model squeeze + safer adapter cleanup
   method: "structural"  # Options: "structural" (torch-pruning) or "unstructured"

@@ -2,3 +2,5 @@
 
 # Python bytecode cache directories
 **/__pycache__/
+
+.*

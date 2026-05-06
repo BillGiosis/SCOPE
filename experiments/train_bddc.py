@@ -130,8 +130,11 @@ def main(args):
     expansion_cfg = config.get('network_expansion', {})
     expansion_strategy = str(expansion_cfg.get('strategy', 'all_layers')).strip().lower()
     pruning_cfg = config.get('network_pruning', {})
+    model_cfg = config.get('model', {})
 
     print(f"Configuration loaded from {args.config}")
+    print(f"Adapt Downsample Blocks: {model_cfg.get('adapt_downsample_blocks', True)}")
+    print(f"Adapter BatchNorm: {model_cfg.get('adapter_batch_norm', True)}")
     print(f"Network Expansion Strategy: {expansion_strategy}")
     print(f"Network Pruning Enabled: {pruning_cfg.get('enabled', False)}")
     print(f"Device: {args.device}")
@@ -149,7 +152,10 @@ def main(args):
 
     print("\nCreating expandable model")
     model = create_expandable_resnet(
-        num_initial_classes=config['benchmark']['total_classes']
+        backbone=model_cfg.get('backbone', 'resnet50d'),
+        num_initial_classes=config['benchmark']['total_classes'],
+        adapt_downsample_blocks=model_cfg.get('adapt_downsample_blocks', True),
+        adapter_batch_norm=model_cfg.get('adapter_batch_norm', True)
     )
     effective_params = model.get_effective_num_parameters() if hasattr(model, 'get_effective_num_parameters') else model.get_num_parameters()
     print(
@@ -245,6 +251,11 @@ def main(args):
         f.write(f"Class Names: {', '.join(class_names)}\n")
         f.write(f"Metric Groups: {', '.join(metric_groups.keys())}\n\n")
 
+        f.write("Model:\n")
+        f.write(f"  Backbone: {model_cfg.get('backbone', 'resnet50d')}\n")
+        f.write(f"  Adapt Downsample Blocks: {model_cfg.get('adapt_downsample_blocks', True)}\n")
+        f.write(f"  Adapter BatchNorm: {model_cfg.get('adapter_batch_norm', True)}\n\n")
+
         f.write("Training:\n")
         f.write(f"  Batch Size: {config['training']['batch_size']}\n")
         f.write(f"  Epochs per Task: {config['training']['epochs_per_task']}\n")
@@ -253,8 +264,7 @@ def main(args):
         f.write(f"  Weight Decay: {config['training']['weight_decay']}\n")
         f.write(f"  AMP: {config['training'].get('use_amp', False)}\n")
         f.write("  Gradient Accumulation: False\n")
-        f.write(f"  Class Balanced Beta: {config['training'].get('cb_beta', 'N/A')}\n")
-        f.write(f"  Weighted Sampler: {config['training'].get('use_weighted_sampler', config.get('data_loading', {}).get('use_weighted_sampler', True))}\n\n")
+        f.write(f"  Class Balanced Beta: {config['training'].get('cb_beta', 'N/A')}\n\n")
 
         f.write("Replay Buffer:\n")
         f.write(f"  Replay Buffer Enabled: {config['replay_buffer'].get('enabled', True)}\n")
@@ -285,11 +295,8 @@ def main(args):
 
         f.write("Network Pruning:\n")
         f.write(f"  Enabled: {pruning_cfg.get('enabled', False)}\n")
-        f.write(f"  Amount (max per task): {pruning_cfg.get('amount', 0.0)}\n")
+        f.write(f"  Non-Hybrid Amount: {pruning_cfg.get('amount', 0.0)}\n")
         f.write(f"  Warmup Tasks: {pruning_cfg.get('warmup_tasks', 2)}\n")
-        f.write(f"  Pruning Interval Tasks: {pruning_cfg.get('interval_tasks', 1)}\n")
-        f.write(f"  Min Amount: {pruning_cfg.get('min_amount', 0.0)}\n")
-        f.write(f"  Max Amount: {pruning_cfg.get('max_amount', pruning_cfg.get('amount', 0.0))}\n")
         f.write(f"  Scope: {pruning_cfg.get('scope', 'whole_model')}\n")
         f.write(f"  Method: {pruning_cfg.get('method', 'structural')}\n")
         hybrid_cfg = pruning_cfg.get('hybrid', {})
@@ -392,10 +399,17 @@ def main(args):
             rollback_suffix = ', rollback=applied' if entry.get('rolled_back', False) else ''
             capacity_before = entry.get('capacity_params_before', entry.get('effective_params_before', 0))
             capacity_after = entry.get('capacity_params_after', entry.get('effective_params_after', 0))
+            if entry.get('method') == 'hybrid':
+                amount_text = (
+                    f"whole_amount={entry.get('whole_model_amount', 0.0):.4f}, "
+                    f"adapter_amount={entry.get('adapter_amount', 0.0):.4f}"
+                )
+            else:
+                amount_text = f"amount={entry['amount']:.4f}"
             f.write(
                 f"  Task {_task_label(task_id)}: pruned={entry['pruned_params']:,}, "
                 f"capacity={capacity_before:,}->{capacity_after:,}, "
-                f"amount={entry['amount']:.4f}, scope={entry['scope']}, "
+                f"{amount_text}, scope={entry['scope']}, "
                 f"method={entry.get('method', 'unstructured')}, "
                 f"importance={entry.get('importance', 'n/a')}{rollback_suffix}\n"
             )
