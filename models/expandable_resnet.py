@@ -8,20 +8,19 @@ import torch.nn as nn
 
 
 class AdapterLayer(nn.Module):
-    def __init__(self, in_channels, out_channels=None, stride=1, reduction=16, use_batch_norm=True):
+    def __init__(self, in_channels, out_channels=None, stride=1, reduction=16):
         super().__init__()
         out_channels = in_channels if out_channels is None else out_channels
         hidden_dim = max(1, in_channels // reduction)
         self.down = nn.Conv2d(in_channels, hidden_dim, kernel_size=1, stride=stride, bias=False)
         self.relu = nn.ReLU(inplace=True)
         self.up = nn.Conv2d(hidden_dim, out_channels, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels) if use_batch_norm else nn.Identity()
         
         nn.init.kaiming_normal_(self.down.weight, mode='fan_out', nonlinearity='relu')
         nn.init.zeros_(self.up.weight)
 
     def forward(self, x):
-        return self.bn(self.up(self.relu(self.down(x))))
+        return self.up(self.relu(self.down(x)))
 
 
 class ExpandableBottleneck(nn.Module):
@@ -33,8 +32,7 @@ class ExpandableBottleneck(nn.Module):
         out_channels,
         stride=1,
         downsample=None,
-        adapt_downsample_blocks=True,
-        adapter_batch_norm=True
+        adapt_downsample_blocks=True
     ):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
@@ -50,7 +48,6 @@ class ExpandableBottleneck(nn.Module):
         self.stride = stride
         self.adapters = nn.ModuleList()
         self.adapt_downsample_blocks = bool(adapt_downsample_blocks)
-        self.adapter_batch_norm = bool(adapter_batch_norm)
         
     def add_adapter(self, reduction=16):
         input_dim = self.conv1.in_channels
@@ -63,8 +60,7 @@ class ExpandableBottleneck(nn.Module):
             input_dim,
             out_channels=output_dim,
             stride=self.stride,
-            reduction=reduction,
-            use_batch_norm=self.adapter_batch_norm
+            reduction=reduction
         )
         if hasattr(self.conv1, 'weight'):
             device = self.conv1.weight.device
@@ -102,13 +98,11 @@ class ExpandableResNet(nn.Module):
         backbone_name='resnet50d',
         num_classes=100,
         resize_input_to=None,
-        adapt_downsample_blocks=True,
-        adapter_batch_norm=True
+        adapt_downsample_blocks=True
     ):
         super().__init__()
         self.resize_input_to = None if resize_input_to in (None, 0, "none", "None") else int(resize_input_to)
         self.adapt_downsample_blocks = bool(adapt_downsample_blocks)
-        self.adapter_batch_norm = bool(adapter_batch_norm)
         
         if backbone_name == 'resnet50d':
             try:
@@ -152,8 +146,7 @@ class ExpandableResNet(nn.Module):
                         planes,
                         stride,
                         downsample,
-                        adapt_downsample_blocks=self.adapt_downsample_blocks,
-                        adapter_batch_norm=self.adapter_batch_norm
+                        adapt_downsample_blocks=self.adapt_downsample_blocks
                     )
                     
                     new_block.conv1.load_state_dict(block.conv1.state_dict())
@@ -305,15 +298,13 @@ def create_expandable_resnet(
     backbone='resnet50d',
     num_initial_classes=10,
     resize_input_to=None,
-    adapt_downsample_blocks=True,
-    adapter_batch_norm=True
+    adapt_downsample_blocks=True
 ):
     model = ExpandableResNet(
         backbone,
         num_initial_classes,
         resize_input_to=resize_input_to,
-        adapt_downsample_blocks=adapt_downsample_blocks,
-        adapter_batch_norm=adapter_batch_norm
+        adapt_downsample_blocks=adapt_downsample_blocks
     )
     model.add_task_head(num_initial_classes)
     return model

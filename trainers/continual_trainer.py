@@ -2681,8 +2681,6 @@ class ContinualLearner:
 
             hidden = max(1, in_channels // 16)
             delta += (in_channels * hidden) + (hidden * out_channels)
-            if bool(getattr(block, 'adapter_batch_norm', True)):
-                delta += 2 * out_channels
 
         return int(delta)
 

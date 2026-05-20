@@ -12,7 +12,7 @@ from tqdm import tqdm
 # ==========================================
 # Only generate the splits used by training.
 # Current BDD-C training uses train + val because config/bddc_config.yaml sets
-# eval_split: "val". Add "test" back only if you switch evaluation to test.
+# eval_split: "val".
 BASE_DATASET_DIR = "/workspace/data/bdd"
 OUTPUT_BASE_DIR = "/workspace/data/BDD-C"
 SPLITS = ["train", "val"]
@@ -44,6 +44,7 @@ JPEG_QUALITY = 95
 MANIFEST_DIRNAME = "manifests"
 METADATA_FILENAME = "metadata.json"
 RESAMPLE = Image.Resampling.BILINEAR
+MANIFEST_ATTRIBUTE_KEYS = ("weather", "timeofday", "scene")
 
 
 def get_image_name(item, json_filename):
@@ -105,20 +106,29 @@ def resolve_task(weather, timeofday):
     return None
 
 
+def get_manifest_attributes(item):
+    """Extract image-level BDD100K attributes preserved in output manifests."""
+    attrs = item.get("attributes", {}) or {}
+    return {
+        attr_name: str(attrs.get(attr_name, "undefined"))
+        for attr_name in MANIFEST_ATTRIBUTE_KEYS
+    }
+
+
 def write_json(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
 
-def write_metadata(output_base_dir, split_counts, categories, weather_values, timeofday_values):
+def write_metadata(output_base_dir, split_counts, categories, attribute_values):
     payload = {
         "format": "jpeg_manifest",
         "image_shape": [OUTPUT_IMAGE_SIZE[1], OUTPUT_IMAGE_SIZE[0], 3],
         "class_names": sorted(categories),
         "metric_groups": {
-            "weather": sorted(weather_values),
-            "timeofday": sorted(timeofday_values),
+            attr_name: sorted(values)
+            for attr_name, values in sorted(attribute_values.items())
         },
         "splits": {
             split: {"task_counts": dict(sorted(task_counts.items()))}
@@ -146,9 +156,9 @@ def process_annotation_file(args):
         }
 
     item = data[0] if isinstance(data, list) else data
-    attrs = item.get("attributes", {})
-    weather = str(attrs.get("weather", "undefined"))
-    timeofday = str(attrs.get("timeofday", "undefined"))
+    image_attributes = get_manifest_attributes(item)
+    weather = image_attributes["weather"]
+    timeofday = image_attributes["timeofday"]
 
     task_name = resolve_task(weather, timeofday)
     if task_name is None:
@@ -181,8 +191,7 @@ def process_annotation_file(args):
                     "image": str(output_rel),
                     "label": box_info["category"],
                     "category": box_info["category"],
-                    "weather": weather,
-                    "timeofday": timeofday,
+                    **image_attributes,
                     "task": task_name,
                     "source_image": img_name,
                     "source_annotation": f"{split_name}/{json_filename}",
@@ -226,8 +235,7 @@ def process_split(split_name, input_img_dir, input_label_dir, output_base_dir):
     no_box_count = 0
     error_count = 0
     categories = set()
-    weather_values = set()
-    timeofday_values = set()
+    attribute_values = defaultdict(set)
     task_counts = defaultdict(int)
     manifests = defaultdict(list)
 
@@ -250,8 +258,8 @@ def process_split(split_name, input_img_dir, input_label_dir, output_base_dir):
                     task_counts[task_name] += count
                     for record in records:
                         categories.add(record["category"])
-                        weather_values.add(record["weather"])
-                        timeofday_values.add(record["timeofday"])
+                        for attr_name in MANIFEST_ATTRIBUTE_KEYS:
+                            attribute_values[attr_name].add(record[attr_name])
                 elif status == "skip":
                     skip_count += 1
                 elif status == "missing":
@@ -291,8 +299,7 @@ def process_split(split_name, input_img_dir, input_label_dir, output_base_dir):
     return {
         "task_counts": task_counts,
         "categories": categories,
-        "weather_values": weather_values,
-        "timeofday_values": timeofday_values,
+        "attribute_values": attribute_values,
         "success_count": success_count,
         "skip_count": skip_count,
         "missing_img_count": missing_img_count,
@@ -305,8 +312,7 @@ if __name__ == "__main__":
     output_root = create_output_directories(OUTPUT_BASE_DIR)
     split_counts = {}
     all_categories = set()
-    all_weather_values = set()
-    all_timeofday_values = set()
+    all_attribute_values = defaultdict(set)
 
     for split in SPLITS:
         img_dir = os.path.join(BASE_DATASET_DIR, "images", split)
@@ -315,16 +321,15 @@ if __name__ == "__main__":
         if summary is not None:
             split_counts[split] = summary["task_counts"]
             all_categories.update(summary["categories"])
-            all_weather_values.update(summary["weather_values"])
-            all_timeofday_values.update(summary["timeofday_values"])
+            for attr_name, values in summary["attribute_values"].items():
+                all_attribute_values[attr_name].update(values)
 
     if split_counts:
         write_metadata(
             OUTPUT_BASE_DIR,
             split_counts=split_counts,
             categories=all_categories,
-            weather_values=all_weather_values,
-            timeofday_values=all_timeofday_values,
+            attribute_values=all_attribute_values,
         )
 
     print("\n" + "=" * 40)

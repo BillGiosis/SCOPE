@@ -13,7 +13,6 @@ benchmark:
 model:
   backbone: "resnet50d"
   adapt_downsample_blocks: false  # If false, adapters are only added to same-shape stride-1 bottlenecks
-  adapter_batch_norm: false  # If false, adapters use Conv-ReLU-Conv without adapter BatchNorm
 
 training:
   batch_size: 10  # 10 as per CLAD-C challenge

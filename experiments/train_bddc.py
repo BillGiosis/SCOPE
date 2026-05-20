@@ -134,7 +134,6 @@ def main(args):
 
     print(f"Configuration loaded from {args.config}")
     print(f"Adapt Downsample Blocks: {model_cfg.get('adapt_downsample_blocks', True)}")
-    print(f"Adapter BatchNorm: {model_cfg.get('adapter_batch_norm', True)}")
     print(f"Network Expansion Strategy: {expansion_strategy}")
     print(f"Network Pruning Enabled: {pruning_cfg.get('enabled', False)}")
     print(f"Device: {args.device}")
@@ -154,8 +153,7 @@ def main(args):
     model = create_expandable_resnet(
         backbone=model_cfg.get('backbone', 'resnet50d'),
         num_initial_classes=config['benchmark']['total_classes'],
-        adapt_downsample_blocks=model_cfg.get('adapt_downsample_blocks', True),
-        adapter_batch_norm=model_cfg.get('adapter_batch_norm', True)
+        adapt_downsample_blocks=model_cfg.get('adapt_downsample_blocks', True)
     )
     effective_params = model.get_effective_num_parameters() if hasattr(model, 'get_effective_num_parameters') else model.get_num_parameters()
     print(
@@ -253,8 +251,7 @@ def main(args):
 
         f.write("Model:\n")
         f.write(f"  Backbone: {model_cfg.get('backbone', 'resnet50d')}\n")
-        f.write(f"  Adapt Downsample Blocks: {model_cfg.get('adapt_downsample_blocks', True)}\n")
-        f.write(f"  Adapter BatchNorm: {model_cfg.get('adapter_batch_norm', True)}\n\n")
+        f.write(f"  Adapt Downsample Blocks: {model_cfg.get('adapt_downsample_blocks', True)}\n\n")
 
         f.write("Training:\n")
         f.write(f"  Batch Size: {config['training']['batch_size']}\n")
