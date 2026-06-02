@@ -26,12 +26,10 @@ class ReplayBuffer:
         self.storage_device = storage_device
         self.use_fp16 = use_fp16
         
-        # State tracking
         self.num_samples = 0
         self.initialized = False
-        self.sampling_weights = None # Cache for sampling weights
-        
-        # Storage
+        self.sampling_weights = None
+
         self.images: Optional[torch.Tensor] = None
         self.labels: Optional[torch.Tensor] = None
         self.task_ids: Optional[torch.Tensor] = None
@@ -104,10 +102,8 @@ class ReplayBuffer:
             soft_dim = soft_targets.size(1) if soft_targets is not None else 0
             self._init_storage(images.shape[1:], soft_dim)
 
-        # Invalidate cache since data changed
         self.sampling_weights = None
 
-        # Prepare Data
         target_img_dtype = torch.float16 if self.use_fp16 else torch.float32
         
         cpu_images = images.detach().to(device=self.storage_device, dtype=target_img_dtype, non_blocking=True)
@@ -117,7 +113,6 @@ class ReplayBuffer:
         if self.soft_targets is not None and soft_targets is not None:
             cpu_soft = soft_targets.detach().to(device=self.storage_device, dtype=target_img_dtype, non_blocking=True)
 
-        # Fill available free slots first.
         free_slots = max(0, self.max_size - self.num_samples)
         fill_count = min(batch_size, free_slots)
 
@@ -134,7 +129,6 @@ class ReplayBuffer:
 
             self.num_samples = fill_end
 
-        # Overflow samples replace existing entries using class-aware eviction.
         overflow_count = batch_size - fill_count
         if overflow_count > 0:
             overflow_indices = self._select_class_aware_overflow_indices(overflow_count)
@@ -166,11 +160,8 @@ class ReplayBuffer:
             batch_indices = valid_indices[sample_idxs]
             
         else:
-            # Use cached weights to avoid recomputing on every step
             if self.sampling_weights is None or self.sampling_weights.size(0) != self.num_samples:
                 current_labels = self.labels[:self.num_samples]
-                
-                # Compute weights
                 counts = torch.bincount(current_labels)
                 class_counts = counts[current_labels].float().clamp_min(1.0)
                 weights = class_counts.rsqrt()
@@ -178,10 +169,8 @@ class ReplayBuffer:
                 weights = torch.clamp(weights, min=0.5, max=2.0)
                 self.sampling_weights = weights
             
-            # Weighted sampling using cached weights
             batch_indices = torch.multinomial(self.sampling_weights, batch_size, replacement=True)
-        
-        # --- Retrieval ---
+
         b_images = self.images[batch_indices]
         b_labels = self.labels[batch_indices]
         b_tasks = self.task_ids[batch_indices]
@@ -216,17 +205,15 @@ class ReplayBuffer:
         target_size = max(1, min(target_size, self.num_samples))
         if self.num_samples <= target_size: return
 
-        # Invalidate cache before modifying buffer
         self.sampling_weights = None
 
-        # Compute Importance
         module_training_modes = {module: module.training for module in model.modules()}
         model.eval()
         importance_scores = torch.zeros(self.num_samples, device=self.storage_device)
         eval_batch_size = 256
 
         try:
-            with torch.no_grad():
+            with torch.inference_mode():
                 for i in range(0, self.num_samples, eval_batch_size):
                     end = min(i + eval_batch_size, self.num_samples)
                     batch_imgs = self.images[i:end].to(device, non_blocking=True)
@@ -242,7 +229,6 @@ class ReplayBuffer:
             for module, was_training in module_training_modes.items():
                 module.train(was_training)
 
-        # Select Indices
         sorted_indices = torch.argsort(importance_scores, descending=True)
         unique_labels = torch.unique(self.labels[:self.num_samples])
         max_per_class = max(1, target_size // len(unique_labels))
@@ -266,7 +252,6 @@ class ReplayBuffer:
             not_selected = sorted_indices[~keep_mask[sorted_indices]]
             keep_mask[not_selected[:remaining]] = True
             
-        # Compact Buffer
         indices_to_keep = torch.nonzero(keep_mask, as_tuple=True)[0]
         self.num_samples = len(indices_to_keep)
         
@@ -289,9 +274,8 @@ class ReplayBuffer:
         image_elements_per_sample = self.images[0].numel()
         size_bytes = slots * image_elements_per_sample * element_size
 
-        # labels/task_ids are int64 tensors
-        size_bytes += slots * 8  # labels
-        size_bytes += slots * 8  # task_ids
+        size_bytes += slots * 8
+        size_bytes += slots * 8
 
         if self.soft_targets is not None:
             soft_elements_per_sample = self.soft_targets[0].numel()

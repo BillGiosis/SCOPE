@@ -32,7 +32,6 @@ training:
 replay_buffer:
   enabled: true  # Enable/disable replay buffer
   max_size: 1000  # CLAD-C challenge limit
-  samples_per_class: 200
   distillation_temp: 1.5
   replay_batch_size: 32
   auto_distill_end_of_task: true  # Distill automatically at each task boundary
@@ -46,8 +45,6 @@ data_loading:
 network_expansion:
   enabled: true
   strategy: "layer2_layer3_split"  # Options: "all_layers" or "layer2_layer3_split"
-  # all_layers: budget-aware, evenly distributed across layer1-4 each task start
-  # strategy: "layer2_layer3_split"  # Expands both layer2 and layer3 each task (50/50)
 
 network_pruning:
   enabled: true
@@ -65,15 +62,6 @@ network_pruning:
   taylor_replay_batches: 8
   taylor_train_batches: 2  # Add a small train signal for better saliency ranking
   taylor_replay_batch_size: 32
-  rebuild_optimizer_after_prune: true
-  recompile_after_prune: true
-  protect_current_task_adapters: true
-  protect_classifier: true
-  protect_downsample: true
-  rollback:
-    enabled: true
-    max_mca_drop: 0.015
-    eval_max_batches: 40
   recovery:
     enabled: true
     epochs: 5

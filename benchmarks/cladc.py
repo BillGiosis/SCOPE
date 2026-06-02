@@ -5,35 +5,46 @@ Uses the official CLAD package from: https://github.com/VerwimpEli/CLAD
 Wraps official CLAD datasets to work with our training pipeline.
 """
 
-import sys
 import os
+import sys
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
-import yaml
 
-# Add official CLAD package to path
-_config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'cladc_config.yaml')
-with open(_config_path, 'r') as _f:
-    CLAD_PATH = yaml.safe_load(_f)['benchmark']['clad_repo_root']
-if CLAD_PATH not in sys.path:
-    sys.path.insert(0, CLAD_PATH)
-
-# Suppress "No Detectron installation found" message (not needed for classification)
-_suppress = os.environ.get('CLAD_SUPPRESS_DETECTRON_MSG', '0') == '1'
-if _suppress:
-    _old_stdout = sys.stdout
-    sys.stdout = StringIO()
-
-try:
-    import clad
-finally:
-    if _suppress:
-        sys.stdout = _old_stdout
-
-import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from typing import List, Dict, Optional
 import numpy as np
+
+from utils.constants import CLADC_INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD
+from utils.sampling import make_inverse_frequency_sampler
+
+_CLAD_MODULE = None
+
+
+@contextmanager
+def _suppress_clad_detectron_message():
+    if os.environ.get('CLAD_SUPPRESS_DETECTRON_MSG', '0') != '1':
+        yield
+        return
+
+    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        yield
+
+
+def _import_clad(clad_repo_root: str):
+    """Import the official CLAD package after the selected config is loaded."""
+    global _CLAD_MODULE
+    if _CLAD_MODULE is not None:
+        return _CLAD_MODULE
+
+    if clad_repo_root and clad_repo_root not in sys.path:
+        sys.path.insert(0, clad_repo_root)
+
+    with _suppress_clad_detectron_message():
+        import clad
+        _CLAD_MODULE = clad
+        return _CLAD_MODULE
+
 
 class CLADCDatasetWrapper(Dataset):
     """
@@ -48,14 +59,11 @@ class CLADCDatasetWrapper(Dataset):
         self.official_dataset = official_dataset
         self.custom_transform = transform
 
-        # Check if this is a ConcatDataset (used for validation)
         self.is_concat = hasattr(official_dataset, 'datasets')
-
 
         self.resize_transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         ])
 
     def __len__(self):
@@ -125,6 +133,7 @@ class CLADCBenchmark:
     def __init__(
         self,
         root_dir: str,
+        clad_repo_root: str,
         batch_size: int = 32,
         num_workers: int = 8,
         prefetch_factor: int = 2
@@ -132,26 +141,32 @@ class CLADCBenchmark:
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor
+        self.input_size = CLADC_INPUT_SIZE
+        resize_after_normalize = transforms.Resize(
+            (self.input_size, self.input_size),
+            interpolation=transforms.InterpolationMode.BILINEAR,
+            antialias=False
+        )
 
-        # Define transforms
         self.train_transform = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            resize_after_normalize
         ])
 
         self.test_transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            resize_after_normalize
         ])
 
-        # Load official CLAD datasets
         print("Loading official CLAD-C datasets")
-        self._train_sets = clad.get_cladc_train(root_dir, img_size=64)
-        self._val_set = clad.get_cladc_val(root_dir, img_size=64)
+        clad_module = _import_clad(clad_repo_root)
+        with _suppress_clad_detectron_message():
+            self._train_sets = clad_module.get_cladc_train(root_dir, img_size=64)
+            self._val_set = clad_module.get_cladc_val(root_dir, img_size=64)
         self._cached_test_loader: Optional[DataLoader] = None
         print(f"Loaded {len(self._train_sets)} training tasks")
 
@@ -183,7 +198,6 @@ class CLADCBenchmark:
             official_dataset = self._val_set
             transform = self.test_transform
 
-        # Wrap official dataset
         dataset = CLADCDatasetWrapper(
             official_dataset=official_dataset,
             transform=transform
@@ -192,26 +206,7 @@ class CLADCBenchmark:
         sampler = None
         shuffle = train
         if train and len(dataset) > 0:
-            labels = dataset.targets
-            label_tensor = torch.as_tensor(labels, dtype=torch.long)
-
-            # Compute class counts and weights (labels are 1-6)
-            class_counts = torch.bincount(label_tensor)
-
-            # Only compute weights for classes that exist
-            class_weights = torch.zeros_like(class_counts, dtype=torch.float32)
-            for i in range(len(class_counts)):
-                if class_counts[i] > 0:
-                    class_weights[i] = 1.0 / class_counts[i].float()
-
-            sample_weights = class_weights[label_tensor]
-
-            from torch.utils.data import WeightedRandomSampler
-            sampler = WeightedRandomSampler(
-                weights=sample_weights,
-                num_samples=len(sample_weights),
-                replacement=True
-            )
+            sampler, class_counts = make_inverse_frequency_sampler(dataset.targets)
             shuffle = False
 
             print(f"  Class counts: {class_counts.tolist()}")
@@ -245,7 +240,6 @@ class CLADCBenchmark:
         train_labels = train_dataset.targets
         num_classes = len(set(train_labels))
 
-        # bincount for class distribution
         class_dist = np.bincount(train_labels, minlength=7).tolist()
 
         return {
@@ -276,6 +270,7 @@ def create_cladc_benchmark(config: Dict) -> CLADCBenchmark:
     
     benchmark = CLADCBenchmark(
         root_dir=benchmark_config['data_root'],
+        clad_repo_root=benchmark_config.get('clad_repo_root', ''),
         batch_size=training_config.get('batch_size', 32),
         num_workers=data_loading_config.get('num_workers', 4),
         prefetch_factor=data_loading_config.get('prefetch_factor', 2)

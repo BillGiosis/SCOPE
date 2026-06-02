@@ -8,15 +8,11 @@ from torch.utils.data import DataLoader, ConcatDataset
 from typing import Dict, List, Optional
 import time
 import os
-import sys
 
 try:
     import torch_pruning as tp
 except ImportError:
     tp = None
-
-# Add parent directory to path
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from models.expandable_resnet import ExpandableResNet
 from buffers.replay_buffer import ReplayBuffer
@@ -25,10 +21,15 @@ from utils.metrics import (
     AMCATester,
     evaluate_model,
     evaluate_model_with_groups,
-    evaluate_model_with_locations,
     compute_model_size
 )
 from utils.losses import ClassBalancedLoss
+from trainers.pruning_policy import (
+    PROTECT_CLASSIFIER,
+    PROTECT_CURRENT_TASK_ADAPTERS,
+    PROTECT_DOWNSAMPLE,
+    RECOMPILE_AFTER_PRUNE,
+)
 
 
 def check_model_health(model: nn.Module, name: str = "Model") -> bool:
@@ -63,7 +64,6 @@ class ContinualLearner:
     ):
         self.device = device
         
-        # Use Channels Last memory format
         if self.device == 'cuda':
             self.model = model.to(device, memory_format=torch.channels_last)
         else:
@@ -73,29 +73,23 @@ class ContinualLearner:
         self.config = config
         self.use_amca = use_amca
         
-        # Initialize AMP Scaler
         self.use_amp = config['training'].get('use_amp', False) and (device == 'cuda')
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp, init_scale=2048.0)
-        if self.use_amp:
-            print("Automatic Mixed Precision (AMP) enabled.")
-
+        
         self.use_torch_compile = config['training'].get('use_torch_compile', True)
         self.train_model = self.model
 
-        # Initialize metrics tracker
         self.metrics = MetricsTracker(
             num_tasks=config['benchmark']['num_tasks']
         )
         self.metric_groups = self._resolve_metric_groups(config.get('benchmark', {}).get('metric_groups', {}))
         
-        # Initialize AMCA tester for CLAD-C
         if use_amca:
             num_classes = config['benchmark'].get('total_classes', 7)
             self.amca_tester = AMCATester(num_classes=num_classes)
         else:
             self.amca_tester = None
         
-        # Training config
         self.epochs_per_task = config['training']['epochs_per_task']
         self.learning_rate = config['training']['learning_rate']
         self.optimizer_name = config['training']['optimizer']
@@ -131,13 +125,6 @@ class ContinualLearner:
         self.hybrid_adapter_scope = str(
             hybrid_cfg.get('adapter_scope', 'older_adapters_only')
         ).strip().lower()
-        self.rebuild_optimizer_after_prune = bool(
-            pruning_cfg.get('rebuild_optimizer_after_prune', True)
-        )
-        self.recompile_after_prune = bool(
-            pruning_cfg.get('recompile_after_prune', True)
-        )
-
         if (
             self.use_torch_compile
             and self.pruning_enabled
@@ -156,20 +143,6 @@ class ContinualLearner:
                     "[WARNING] Could not enable dynamic parameter shapes for torch.compile: "
                     f"{e}"
                 )
-
-        self.protect_current_task_adapters = bool(
-            pruning_cfg.get('protect_current_task_adapters', True)
-        )
-        self.protect_classifier = bool(pruning_cfg.get('protect_classifier', True))
-        self.protect_downsample = bool(pruning_cfg.get('protect_downsample', True))
-
-        rollback_cfg = pruning_cfg.get('rollback', {})
-        self.prune_rollback_enabled = bool(rollback_cfg.get('enabled', False))
-        self.prune_rollback_max_mca_drop = float(rollback_cfg.get('max_mca_drop', 0.01))
-        self.prune_rollback_eval_max_batches = max(
-            1,
-            int(rollback_cfg.get('eval_max_batches', 20))
-        )
 
         recovery_cfg = pruning_cfg.get('recovery', {})
         self.prune_recovery_enabled = bool(recovery_cfg.get('enabled', True))
@@ -191,7 +164,6 @@ class ContinualLearner:
                 "Falling back to 'magnitude'."
             )
             self.pruning_importance = 'magnitude'
-        self.prune_rollback_max_mca_drop = max(0.0, self.prune_rollback_max_mca_drop)
         self.prune_recovery_lr_scale = max(self.prune_recovery_lr_scale, 0.0)
 
         base_params = int(self._get_effective_model_params())
@@ -213,7 +185,6 @@ class ContinualLearner:
         self.last_good_model_snapshot: Optional[nn.Module] = None
         self.last_good_task_id: Optional[int] = None
         self._cached_eval_loaders: Dict[int, DataLoader] = {}
-        self._cached_location_ids: Dict[int, torch.Tensor] = {}
         self._cached_group_ids: Dict[int, Dict[str, torch.Tensor]] = {}
 
     @staticmethod
@@ -252,7 +223,6 @@ class ContinualLearner:
         if self.expansion_strategy == 'all_layers':
             return self._get_all_layers_budget_aware_targets()
 
-        # layer2_layer3_split: expand both layers every task (50/50 within task).
         return list(self.expansion_layer_order)
 
     def _get_effective_model_params(self) -> int:
@@ -467,9 +437,9 @@ class ContinualLearner:
                 print(f"[WARNING] Could not derive pruning example input from loader: {e}")
 
         try:
-            # Normal path uses one sample from train_loader; fallback matches benchmark defaults.
-            benchmark_name = str(self.config.get('benchmark', {}).get('name', '')).strip().lower()
-            shape = (1, 3, 64, 64) if benchmark_name == 'clad-c' else (1, 3, 224, 224)
+            # Normal path uses one sample from train_loader; fallback matches
+            # the fixed model input size used by the current benchmarks.
+            shape = (1, 3, 224, 224)
             example = torch.randn(*shape, device=self.device)
             if self.device == 'cuda':
                 example = example.contiguous(memory_format=torch.channels_last)
@@ -483,7 +453,7 @@ class ContinualLearner:
         ignored_layers = []
         ignored_ids = set()
 
-        if self.protect_classifier:
+        if PROTECT_CLASSIFIER:
             classifier_module = getattr(self.model, 'fc', None)
             if classifier_module is not None and id(classifier_module) not in ignored_ids:
                 ignored_layers.append(classifier_module)
@@ -492,17 +462,17 @@ class ContinualLearner:
         for module_name, module in self.model.named_modules():
             should_ignore = False
 
-            if self.protect_classifier and module_name == 'fc':
+            if PROTECT_CLASSIFIER and module_name == 'fc':
                 should_ignore = True
 
-            if self.protect_downsample and 'downsample' in module_name:
+            if PROTECT_DOWNSAMPLE and 'downsample' in module_name:
                 should_ignore = True
 
             if should_ignore and id(module) not in ignored_ids:
                 ignored_layers.append(module)
                 ignored_ids.add(id(module))
 
-        if self.protect_current_task_adapters:
+        if PROTECT_CURRENT_TASK_ADAPTERS:
             for _, _, adapter in self._iter_adapters():
                 if id(adapter) not in self.current_task_new_adapter_ids:
                     continue
@@ -515,90 +485,6 @@ class ContinualLearner:
                     ignored_ids.add(id(m))
 
         return ignored_layers
-
-    def _compute_mca_from_loader(
-        self,
-        dataloader: Optional[DataLoader],
-        max_batches: Optional[int] = None
-    ) -> Optional[float]:
-        """Compute MCA on a dataloader without mutating AMCA history state."""
-        if dataloader is None:
-            return None
-
-        if max_batches is None:
-            max_batches = self.prune_rollback_eval_max_batches
-        max_batches = max(1, int(max_batches))
-
-        num_classes = int(self.config.get('benchmark', {}).get('total_classes', 7))
-        max_cls = max(1, num_classes)
-        class_correct = torch.zeros(max_cls, device=self.device, dtype=torch.long)
-        class_total = torch.zeros(max_cls, device=self.device, dtype=torch.long)
-
-        self.model.eval()
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(dataloader):
-                if batch_idx >= max_batches:
-                    break
-
-                if not isinstance(batch, (tuple, list)) or len(batch) < 2:
-                    continue
-
-                images, labels = batch[0], batch[1]
-                if self.device == 'cuda':
-                    images = images.to(
-                        self.device,
-                        dtype=torch.float32,
-                        non_blocking=True,
-                        memory_format=torch.channels_last
-                    )
-                else:
-                    images = images.to(self.device, dtype=torch.float32, non_blocking=True)
-                labels = labels.to(self.device, non_blocking=True)
-
-                with torch.amp.autocast('cuda', enabled=self.use_amp):
-                    outputs = self.model(images)
-                predicted = outputs.argmax(dim=1)
-
-                class_total += torch.bincount(labels, minlength=max_cls)[:max_cls]
-                correct_mask = (predicted == labels)
-                class_correct += torch.bincount(labels[correct_mask], minlength=max_cls)[:max_cls]
-
-        valid = class_total > 0
-        if valid.any():
-            mca = (class_correct.float()[valid] / class_total.float()[valid]).mean().item()
-            return float(mca)
-        return 0.0
-
-    def _snapshot_model_for_rollback(self) -> Optional[nn.Module]:
-        """Create a CPU snapshot for prune rollback checks."""
-        if not self.prune_rollback_enabled:
-            return None
-        try:
-            return copy.deepcopy(self.model).cpu()
-        except Exception as e:
-            print(f"[WARNING] Could not snapshot model for rollback: {e}")
-            return None
-
-    def _restore_model_from_snapshot(self, snapshot_model: Optional[nn.Module], task_id: int) -> bool:
-        """Restore model from rollback snapshot and refresh training state."""
-        if snapshot_model is None:
-            return False
-
-        try:
-            restored_model = snapshot_model.to(self.device)
-
-            self.model = restored_model
-            self.train_model = self.model
-
-            self._refresh_training_state_after_prune(
-                task_id=task_id,
-                learning_rate=self.learning_rate,
-                scheduler_tmax=self.epochs_per_task
-            )
-            return True
-        except Exception as e:
-            print(f"[WARNING] Could not restore rollback snapshot: {e}")
-            return False
 
     def _model_has_nonfinite_parameters(self) -> bool:
         """Return True if any model parameter contains NaN or Inf."""
@@ -825,76 +711,6 @@ class ContinualLearner:
             )
             return tp.importance.MagnitudeImportance(p=1), 'magnitude'
 
-    def _maybe_rollback_post_prune(
-        self,
-        task_id: int,
-        prune_applied: bool,
-        eval_loader: Optional[DataLoader],
-        pre_prune_mca: Optional[float],
-        snapshot_model: Optional[nn.Module]
-    ) -> bool:
-        """Rollback pruning if post-prune MCA drop exceeds configured threshold."""
-        if not prune_applied:
-            return False
-        if not self.prune_rollback_enabled:
-            return False
-        if eval_loader is None:
-            print(f"Skipping prune rollback check at task {self._task_label(task_id)}: no evaluation loader")
-            return False
-        if pre_prune_mca is None:
-            print(f"Skipping prune rollback check at task {self._task_label(task_id)}: pre-prune MCA unavailable")
-            return False
-
-        try:
-            post_prune_mca = self._compute_mca_from_loader(
-                eval_loader,
-                max_batches=self.prune_rollback_eval_max_batches
-            )
-        except Exception as e:
-            print(f"[WARNING] Could not compute post-prune MCA for rollback check: {e}")
-            return False
-
-        if post_prune_mca is None:
-            return False
-
-        mca_drop = float(pre_prune_mca - post_prune_mca)
-        rollback_needed = mca_drop > self.prune_rollback_max_mca_drop
-
-        if self.pruning_history and self.pruning_history[-1].get('task_id') == int(task_id):
-            self.pruning_history[-1]['rollback_pre_mca'] = float(pre_prune_mca)
-            self.pruning_history[-1]['rollback_post_mca'] = float(post_prune_mca)
-            self.pruning_history[-1]['rollback_mca_drop'] = float(mca_drop)
-            self.pruning_history[-1]['rollback_threshold'] = float(self.prune_rollback_max_mca_drop)
-
-        if not rollback_needed:
-            print(
-                f"Prune rollback check passed at task {self._task_label(task_id)}: "
-                f"MCA drop={mca_drop:.4f} <= threshold={self.prune_rollback_max_mca_drop:.4f}"
-            )
-            if self.pruning_history and self.pruning_history[-1].get('task_id') == int(task_id):
-                self.pruning_history[-1]['rolled_back'] = False
-            return False
-
-        restored = self._restore_model_from_snapshot(snapshot_model=snapshot_model, task_id=task_id)
-        if not restored:
-            print(
-                f"[WARNING] Prune rollback triggered at task {self._task_label(task_id)} but restore failed; "
-                "keeping pruned model."
-            )
-            if self.pruning_history and self.pruning_history[-1].get('task_id') == int(task_id):
-                self.pruning_history[-1]['rolled_back'] = False
-                self.pruning_history[-1]['rollback_restore_failed'] = True
-            return False
-
-        print(
-            f"Rolled back pruning at task {self._task_label(task_id)}: "
-            f"MCA drop={mca_drop:.4f} > threshold={self.prune_rollback_max_mca_drop:.4f}"
-        )
-        if self.pruning_history and self.pruning_history[-1].get('task_id') == int(task_id):
-            self.pruning_history[-1]['rolled_back'] = True
-
-        return True
-
     def _refresh_training_state_after_prune(
         self,
         task_id: int,
@@ -905,15 +721,14 @@ class ContinualLearner:
         expected_num_classes = int(self.config.get('benchmark', {}).get('total_classes', 7))
         self._ensure_classifier_head(expected_num_classes)
 
-        if self.rebuild_optimizer_after_prune:
-            self._create_optimizer(
-                learning_rate=learning_rate,
-                scheduler_tmax=scheduler_tmax
-            )
-            print(f"Rebuilt optimizer after pruning for task {self._task_label(task_id)}")
+        self._create_optimizer(
+            learning_rate=learning_rate,
+            scheduler_tmax=scheduler_tmax
+        )
+        print(f"Rebuilt optimizer after pruning for task {self._task_label(task_id)}")
 
         self.train_model = self.model
-        if self.recompile_after_prune and self.use_torch_compile:
+        if RECOMPILE_AFTER_PRUNE and self.use_torch_compile:
             try:
                 try:
                     import torch._dynamo as dynamo
@@ -1111,7 +926,6 @@ class ContinualLearner:
         
         self._create_optimizer()
         
-        # --- Class Balanced Loss Setup ---
         print("Calculating class counts for Class Balanced Loss")
         num_classes = int(
             getattr(self.model.fc, 'out_features', self.config['benchmark'].get('total_classes', 7))
@@ -1164,14 +978,12 @@ class ContinualLearner:
         if benchmark_name == 'clad-c' and hasattr(self.criterion, 'weights') and self.criterion.weights.numel() > 0:
             self.criterion.weights[0] = 0.0
             
-        # Reuse one loader for all evals in this task
         all_test_datasets = []
         for tid in range(task_id + 1):
             if tid < len(test_loaders) and test_loaders[tid] is not None:
                 all_test_datasets.append(test_loaders[tid].dataset)
         
         cached_test_loader = None
-        cached_location_ids = None
         cached_group_ids = {}
         if all_test_datasets:
             if len(all_test_datasets) == 1:
@@ -1195,12 +1007,6 @@ class ContinualLearner:
                 )
             cached_test_loader = self._cached_eval_loaders[cache_key]
 
-            if cache_key not in self._cached_location_ids:
-                self._cached_location_ids[cache_key] = self._build_location_id_tensor(
-                    combined_test_dataset=combined_test_dataset
-                )
-            cached_location_ids = self._cached_location_ids[cache_key]
-
             if cache_key not in self._cached_group_ids:
                 self._cached_group_ids[cache_key] = {}
             for group_name, group_names in self.metric_groups.items():
@@ -1212,8 +1018,7 @@ class ContinualLearner:
                     )
                 cached_group_ids[group_name] = self._cached_group_ids[cache_key][group_name]
 
-        # --- Training Loop ---
-        replay_candidates = {'images': [], 'labels': [], 'logits': []} # Logits added for re-use
+        replay_candidates = {'images': [], 'labels': [], 'logits': []}
         last_eval_snapshot = None
         from tqdm import tqdm
 
@@ -1236,7 +1041,6 @@ class ContinualLearner:
                     epoch,
                     collection_dict,
                     task_progress_bar=task_progress_bar,
-                    epoch_total=self.epochs_per_task
                 )
                 task_progress_bar.set_postfix(
                     {
@@ -1247,19 +1051,20 @@ class ContinualLearner:
                 )
                 task_progress_bar.update(1)
                 
-                # Evaluate only at task end.
-                if is_last_epoch:
+                # Evaluate only at task end. When pruning can mutate the model
+                # after the epoch, defer metric recording until the final model
+                # state is known.
+                if is_last_epoch and not self._is_pruning_task(task_id):
                     print(f"\nEpoch {epoch + 1}/{self.epochs_per_task} - Evaluating")
                     last_eval_snapshot = self._evaluate_and_update_metrics(
                         task_id,
                         cached_test_loader,
-                        group_id_tensors=cached_group_ids or ({'location': cached_location_ids} if cached_location_ids is not None else {}),
+                        group_id_tensors=cached_group_ids,
                         run_amca=False
                     )
         finally:
             task_progress_bar.close()
             
-        # --- Replay Buffer Update ---
         replay_enabled = self.config.get('replay_buffer', {}).get('enabled', True)
         if replay_enabled:
             if len(replay_candidates['images']) > 0:
@@ -1267,36 +1072,11 @@ class ContinualLearner:
             else:
                 self._update_replay_buffer(task_id, train_loader)
 
-        # Automatically distill replay memory at each chronological task boundary.
         self._auto_distill_replay_buffer_end_of_task(task_id)
-
-        pre_prune_mca = None
-        rollback_snapshot = None
-        if self.prune_rollback_enabled and self._is_pruning_task(task_id):
-            pre_prune_mca = self._compute_mca_from_loader(
-                cached_test_loader,
-                max_batches=self.prune_rollback_eval_max_batches
-            )
-            rollback_snapshot = self._snapshot_model_for_rollback()
-            if pre_prune_mca is not None:
-                print(f"Pre-prune MCA estimate (task {self._task_label(task_id)}): {pre_prune_mca:.4f}")
 
         prune_applied = self._auto_prune_network_end_of_task(task_id, train_loader=train_loader)
         self._post_prune_recovery(task_id, train_loader, prune_applied)
 
-        rolled_back = self._maybe_rollback_post_prune(
-            task_id=task_id,
-            prune_applied=prune_applied,
-            eval_loader=cached_test_loader,
-            pre_prune_mca=pre_prune_mca,
-            snapshot_model=rollback_snapshot
-        )
-        if rolled_back:
-            prune_applied = False
-
-        # Final evaluation / AMCA update.
-        # If model stayed unchanged after the last epoch evaluation, reuse those
-        # metrics and only record AMCA to avoid a redundant full validation pass.
         if not prune_applied and last_eval_snapshot is not None:
             print(
                 f"\nFinal evaluation after task {self._task_label(task_id)}: "
@@ -1325,11 +1105,10 @@ class ContinualLearner:
             self._evaluate_and_update_metrics(
                 task_id,
                 cached_test_loader,
-                group_id_tensors=cached_group_ids or ({'location': cached_location_ids} if cached_location_ids is not None else {}),
+                group_id_tensors=cached_group_ids,
                 run_amca=True
             )
 
-        # Record full task compute time (training + replay + final evaluation)
         task_elapsed_time = time.time() - task_start_time
         self.metrics.record_task_time(task_id, task_elapsed_time)
         self.metrics.update_compute_cost(task_elapsed_time)
@@ -1354,7 +1133,6 @@ class ContinualLearner:
         epoch: int,
         collection_dict: Optional[Dict] = None,
         task_progress_bar=None,
-        epoch_total: Optional[int] = None
     ) -> tuple:
         """Train for one epoch with Batched Replay and Logit Capture."""
         from tqdm import tqdm
@@ -1362,8 +1140,8 @@ class ContinualLearner:
         self.train_model.train()
         self._apply_adapter_training_modes()
 
-        total_loss = 0.0
-        correct = 0
+        total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
+        correct = torch.zeros((), device=self.device, dtype=torch.long)
         total = 0
         
         training_config = self.config.get('training', {})
@@ -1379,7 +1157,6 @@ class ContinualLearner:
         replay_enabled = bool(replay_config.get('enabled', True))
         replay_batch_size = max(1, int(replay_config.get('replay_batch_size', 32)))
         replay_interval_batches = max(1, int(replay_config.get('replay_interval_batches', 1)))
-        fuse_replay_forward = bool(replay_config.get('fuse_replay_forward', False))
         replay_buffer_len = len(self.replay_buffer) if replay_enabled else 0
         has_replay_data = replay_enabled and replay_buffer_len > 0
         criterion = self.criterion
@@ -1463,7 +1240,6 @@ class ContinualLearner:
                 
                 labels = labels.to(self.device, non_blocking=True)
                 
-                # Logic to capture logits for replay reuse
                 capture_indices = None
                 if collection_enabled and collected_count < collection_limit:
                     remaining_slots = int(collection_limit - collected_count)
@@ -1529,7 +1305,7 @@ class ContinualLearner:
                             )
                         r_lbls = replay_batch['labels'].to(self.device, non_blocking=True)
 
-                if fuse_replay_forward and r_imgs is not None:
+                if r_imgs is not None:
                     combined_images = torch.cat((images, r_imgs), dim=0)
                     current_batch_size = int(images.size(0))
                     with torch.amp.autocast('cuda', enabled=self.use_amp):
@@ -1622,18 +1398,21 @@ class ContinualLearner:
                 else:
                     raise
             
-            loss_val = loss.item() * accumulation_steps if torch.is_tensor(loss) else 0.0
-            total_loss += loss_val
+            if torch.is_tensor(loss):
+                total_loss += loss.detach().float() * accumulation_steps
             _, predicted = outputs_float.max(1)
             total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            correct += predicted.eq(labels).sum().detach()
             
             if total > 0 and (
                 (batch_idx + 1) % progress_update_interval == 0
                 or (batch_idx + 1) == train_loader_len
             ):
                 if manage_local_pbar:
-                    pbar.set_postfix({'loss': f'{total_loss/(batch_idx+1):.4f}', 'acc': f'{100.*correct/total:.2f}%'})
+                    pbar.set_postfix({
+                        'loss': f'{float(total_loss.item()) / (batch_idx + 1):.4f}',
+                        'acc': f'{100.0 * float(correct.item()) / total:.2f}%'
+                    })
         
         if has_pending_grad:
             self.scaler.unscale_(self.optimizer)
@@ -1648,8 +1427,8 @@ class ContinualLearner:
         if manage_local_pbar:
             pbar.close()
 
-        epoch_avg_loss = float(total_loss / max(1, train_loader_len))
-        epoch_acc = float(100.0 * correct / max(1, total))
+        epoch_avg_loss = float(total_loss.item() / max(1, train_loader_len))
+        epoch_acc = float(100.0 * correct.item() / max(1, total))
         return epoch_avg_loss, epoch_acc
 
     def _update_replay_buffer_from_memory(self, task_id: int, collected_data: Dict):
@@ -1663,7 +1442,6 @@ class ContinualLearner:
         all_images = torch.cat(collected_data['images'], dim=0)
         all_labels = torch.cat(collected_data['labels'], dim=0)
         
-        # Use pre-computed logits
         if 'logits' in collected_data and len(collected_data['logits']) > 0:
             all_logits = torch.cat(collected_data['logits'], dim=0)
             finite_logits_mask = torch.isfinite(all_logits).all(dim=1)
@@ -1692,7 +1470,7 @@ class ContinualLearner:
             batch_size = 128
             
             try:
-                with torch.no_grad():
+                with torch.inference_mode():
                     for i in range(0, len(all_images), batch_size):
                         batch_imgs = all_images[i:i+batch_size]
                         if self.device == 'cuda':
@@ -1838,7 +1616,7 @@ class ContinualLearner:
                 for adapter_idx, adapter in enumerate(adapters):
                     adapter_id = id(adapter)
                     is_new_adapter = adapter_id in self.current_task_new_adapter_ids
-                    if self.protect_current_task_adapters and is_new_adapter:
+                    if PROTECT_CURRENT_TASK_ADAPTERS and is_new_adapter:
                         continue
                     if self.pruning_scope == 'older_adapters_only' and is_new_adapter:
                         continue
@@ -1873,7 +1651,7 @@ class ContinualLearner:
         remain untouched at this task boundary.
         """
         protected_module_ids = set()
-        if self.protect_current_task_adapters:
+        if PROTECT_CURRENT_TASK_ADAPTERS:
             for _, _, adapter in self._iter_adapters():
                 if id(adapter) not in self.current_task_new_adapter_ids:
                     continue
@@ -1881,7 +1659,7 @@ class ContinualLearner:
                     protected_module_ids.add(id(m))
 
         modules_to_prune = []
-        classifier_module = getattr(self.model, 'fc', None) if self.protect_classifier else None
+        classifier_module = getattr(self.model, 'fc', None) if PROTECT_CLASSIFIER else None
         for module_name, module in self.model.named_modules():
             if not isinstance(module, (nn.Conv2d, nn.Linear)):
                 continue
@@ -1902,10 +1680,10 @@ class ContinualLearner:
             if id(module) in protected_module_ids:
                 continue
 
-            if self.protect_classifier and module_name == 'fc':
+            if PROTECT_CLASSIFIER and module_name == 'fc':
                 continue
 
-            if self.protect_downsample and 'downsample' in module_name:
+            if PROTECT_DOWNSAMPLE and 'downsample' in module_name:
                 continue
 
             modules_to_prune.append((module, 'weight'))
@@ -2183,10 +1961,6 @@ class ContinualLearner:
         for key in (
             'taylor_replay_batches',
             'taylor_train_batches',
-            'rollback_pre_mca',
-            'rollback_post_mca',
-            'rollback_mca_drop',
-            'rollback_threshold',
         ):
             values = [entry.get(key) for entry in entries if key in entry]
             if values:
@@ -2221,7 +1995,6 @@ class ContinualLearner:
             whole_model_success = False
             adapter_success = False
             try:
-                # Step 1: Very gentle base compression.
                 self.pruning_scope = 'whole_model'
                 self.pruning_method = 'structural'
                 self.pruning_amount = self.hybrid_whole_model_amount
@@ -2233,7 +2006,6 @@ class ContinualLearner:
                 expected_num_classes = int(self.config.get('benchmark', {}).get('total_classes', 7))
                 self._ensure_classifier_head(expected_num_classes)
 
-                # Step 2: Adapter cleanup always runs after gentle whole-model compression.
                 self.pruning_scope = self.hybrid_adapter_scope
                 self.pruning_method = original_method
                 self.pruning_amount = self.hybrid_adapter_amount
@@ -2355,7 +2127,7 @@ class ContinualLearner:
                 for _, _, adapter in self._iter_adapters():
                     is_new_adapter = id(adapter) in self.current_task_new_adapter_ids
                     if is_new_adapter and (
-                        self.protect_current_task_adapters
+                        PROTECT_CURRENT_TASK_ADAPTERS
                         or self.pruning_scope == 'older_adapters_only'
                     ):
                         continue
@@ -2479,24 +2251,6 @@ class ContinualLearner:
                 param.requires_grad = original_requires_grad
             self.model.zero_grad(set_to_none=True)
 
-    def _resolve_location_for_dataset_index(self, dataset, idx: int):
-        """Resolve location string for an index from wrapped/concat/subset datasets."""
-        if hasattr(dataset, 'get_location'):
-            return dataset.get_location(idx)
-
-        if hasattr(dataset, 'dataset') and hasattr(dataset, 'indices'):
-            parent_idx = dataset.indices[idx]
-            return self._resolve_location_for_dataset_index(dataset.dataset, parent_idx)
-
-        if hasattr(dataset, 'datasets'):
-            sample_idx = idx
-            for d in dataset.datasets:
-                if sample_idx < len(d):
-                    return self._resolve_location_for_dataset_index(d, sample_idx)
-                sample_idx -= len(d)
-
-        return None
-
     @staticmethod
     def _resolve_metric_groups(metric_groups_cfg: Dict) -> Dict[str, List[str]]:
         """Normalize benchmark metric-group config to {group_name: [display values]}."""
@@ -2552,22 +2306,6 @@ class ContinualLearner:
             group_ids[idx] = int(group_to_id.get(group_value, -1))
         return group_ids
 
-    def _build_location_id_tensor(self, combined_test_dataset) -> torch.Tensor:
-        """Create a dense location-id tensor aligned with test-dataset order."""
-        location_to_id = {
-            'Citystreet': 0,
-            'Countryroad': 1,
-            'Highway': 2
-        }
-
-        location_ids = torch.full((len(combined_test_dataset),), -1, dtype=torch.long)
-        for idx in range(len(combined_test_dataset)):
-            location = self._resolve_location_for_dataset_index(combined_test_dataset, idx)
-            mapped_id = location_to_id.get(location, -1)
-            location_ids[idx] = int(mapped_id)
-
-        return location_ids
-
     def _evaluate_and_update_metrics(
         self,
         task_id: int,
@@ -2575,7 +2313,6 @@ class ContinualLearner:
         group_id_tensors: Optional[Dict[str, torch.Tensor]] = None,
         run_amca: bool = True
     ):
-        # Uses persistent loader
         if test_loader is None:
             return None
 
@@ -2618,7 +2355,6 @@ class ContinualLearner:
                 )
                 self.metrics.update_accuracy(task_id, overall_accuracy, per_class_acc)
             
-            # AMCA Logic
             if self.use_amca and self.amca_tester:
                 if run_amca:
                     try:
@@ -2654,6 +2390,7 @@ class ContinualLearner:
             'overall_accuracy': float(overall_accuracy),
             'per_class_acc': per_class_acc
         }
+
     def _estimate_expand_layer_params_delta(self, layer_name: str) -> int:
         """
         Estimate parameter increase for one expand_layer action.
@@ -2706,6 +2443,7 @@ class ContinualLearner:
         self.task_expansions = checkpoint.get('task_expansions', {})
         self.expansion_history = checkpoint.get('expansion_history', [])
         self.pruning_history = checkpoint.get('pruning_history', [])
+
 
 def create_trainer(config: Dict, model, replay_buffer, device='cuda', use_amca=False):
     return ContinualLearner(

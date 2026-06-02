@@ -7,23 +7,13 @@ from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 
-# ==========================================
-# CONFIGURATION - UPDATE THESE BASE PATHS
-# ==========================================
-# Only generate the splits used by training.
-# Current BDD-C training uses train + val because config/bddc_config.yaml sets
-# eval_split: "val".
 BASE_DATASET_DIR = "/workspace/data/bdd"
 OUTPUT_BASE_DIR = "/workspace/data/BDD-C"
 SPLITS = ["train", "val"]
 
-# Parallelism for crop/resize work. Tune if needed.
 NUM_WORKERS = max(1, min(32, (os.cpu_count() or 4) - 1))
 CHUNKSIZE = 31
 
-# ==========================================
-# TASK DEFINITIONS
-# ==========================================
 TASKS = {
     "task_1_clear_day": lambda weather, timeofday: timeofday == "daytime"
     and weather in {"clear", "partly cloudy"},
@@ -36,9 +26,6 @@ TASKS = {
     and weather in {"rainy", "snowy", "foggy", "overcast"},
 }
 
-# ==========================================
-# IMAGE TRANSFORMATION / STORAGE
-# ==========================================
 OUTPUT_IMAGE_SIZE = (224, 224)
 JPEG_QUALITY = 95
 MANIFEST_DIRNAME = "manifests"

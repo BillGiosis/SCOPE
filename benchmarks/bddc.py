@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+
+from utils.constants import BDDC_INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD
+from utils.sampling import make_inverse_frequency_sampler
 
 
 def _load_image(path: str) -> Image.Image:
@@ -100,16 +102,16 @@ class BDDCBenchmark:
         self.eval_split = str(eval_split).strip().lower()
 
         self.train_transform = transforms.Compose([
-            transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.Resize((BDDC_INPUT_SIZE, BDDC_INPUT_SIZE), interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ])
         self.test_transform = transforms.Compose([
-            transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.Resize((BDDC_INPUT_SIZE, BDDC_INPUT_SIZE), interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ])
 
         train_task_dirs = self._get_task_dirs('train')
@@ -123,7 +125,7 @@ class BDDCBenchmark:
         if not metadata_path.is_file():
             raise ValueError(
                 f"Missing BDD-C metadata manifest: {metadata_path}. "
-                "Run /home/bill/bdd_c_split.py first."
+                "Run scripts/bddc_split.py first."
             )
 
         metadata = _load_json(metadata_path)
@@ -180,7 +182,7 @@ class BDDCBenchmark:
         if not manifest_path.is_file():
             raise ValueError(
                 f"Missing BDD-C manifest for split='{split}' task='{task_name}': {manifest_path}. "
-                "Run /home/bill/bdd_c_split.py first."
+                "Run scripts/bddc_split.py first."
             )
 
         records = _load_json(manifest_path)
@@ -234,19 +236,9 @@ class BDDCBenchmark:
         shuffle = train
 
         if train and len(dataset) > 0:
-            label_tensor = torch.as_tensor(dataset.targets, dtype=torch.long)
-            class_counts = torch.bincount(label_tensor, minlength=self.num_classes)
-            class_weights = torch.zeros_like(class_counts, dtype=torch.float32)
-            for i in range(len(class_counts)):
-                if class_counts[i] > 0:
-                    class_weights[i] = 1.0 / class_counts[i].float()
-
-            sample_weights = class_weights[label_tensor]
-            from torch.utils.data import WeightedRandomSampler
-            sampler = WeightedRandomSampler(
-                weights=sample_weights,
-                num_samples=len(sample_weights),
-                replacement=True
+            sampler, class_counts = make_inverse_frequency_sampler(
+                dataset.targets,
+                min_classes=self.num_classes
             )
             shuffle = False
 

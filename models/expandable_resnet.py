@@ -97,11 +97,9 @@ class ExpandableResNet(nn.Module):
         self,
         backbone_name='resnet50d',
         num_classes=100,
-        resize_input_to=None,
         adapt_downsample_blocks=True
     ):
         super().__init__()
-        self.resize_input_to = None if resize_input_to in (None, 0, "none", "None") else int(resize_input_to)
         self.adapt_downsample_blocks = bool(adapt_downsample_blocks)
         
         if backbone_name == 'resnet50d':
@@ -246,14 +244,6 @@ class ExpandableResNet(nn.Module):
         return x
     
     def forward(self, x):
-        if self.resize_input_to is not None and x.shape[-2:] != (self.resize_input_to, self.resize_input_to):
-            x = x.float()
-            x = torch.nn.functional.interpolate(
-                x,
-                size=(self.resize_input_to, self.resize_input_to),
-                mode='bilinear',
-                align_corners=False
-            )
         features = self.get_features(x)
         if self.fc is None:
             raise ValueError("Classifier not initialized. Call add_task_head first.")
@@ -297,13 +287,11 @@ class ExpandableResNet(nn.Module):
 def create_expandable_resnet(
     backbone='resnet50d',
     num_initial_classes=10,
-    resize_input_to=None,
     adapt_downsample_blocks=True
 ):
     model = ExpandableResNet(
         backbone,
         num_initial_classes,
-        resize_input_to=resize_input_to,
         adapt_downsample_blocks=adapt_downsample_blocks
     )
     model.add_task_head(num_initial_classes)
