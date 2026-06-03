@@ -55,12 +55,12 @@ network_pruning:
   method: "structural"  # Options: "structural" (torch-pruning) or "unstructured"
   hybrid:
     whole_model_amount: 0.01
-    adapter_amount: 0.30
+    adapter_amount: 0.40
     adapter_scope: "older_adapters_only"  # "older_adapters_only" or "all_adapters"
   importance: "taylor"  # Options: "magnitude" or "taylor"
   use_replay_for_taylor: true
-  taylor_replay_batches: 8
-  taylor_train_batches: 2  # Add a small train signal for better saliency ranking
+  taylor_replay_batches: 6
+  taylor_train_batches: 4
   taylor_replay_batch_size: 32
   recovery:
     enabled: true
