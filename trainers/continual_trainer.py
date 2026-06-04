@@ -934,7 +934,7 @@ class ContinualLearner:
         if use_class_balanced_loss:
             print("Calculating class counts for Class Balanced Loss")
         else:
-            print("Class Balanced Loss disabled; using standard cross entropy")
+            print("Class Balanced Loss disabled; using Cross Entropy Loss")
         num_classes = int(
             getattr(self.model.fc, 'out_features', self.config['benchmark'].get('total_classes', 7))
         )
