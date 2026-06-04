@@ -68,6 +68,7 @@ def write_bddc_results(config: dict, trainer, efficiency_metrics, timestamp: str
         f.write(f"  Weight Decay: {config['training']['weight_decay']}\n")
         f.write(f"  AMP: {config['training'].get('use_amp', False)}\n")
         f.write("  Gradient Accumulation: False\n")
+        f.write(f"  Class Balanced Loss: {config['training'].get('use_class_balanced_loss', True)}\n")
         f.write(f"  Class Balanced Beta: {config['training'].get('cb_beta', 'N/A')}\n\n")
 
         write_common_replay_data_pruning_sections(f, config, pruning_cfg, expansion_cfg, expansion_strategy, validation_cfg)

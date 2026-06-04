@@ -67,6 +67,7 @@ def write_cladc_results(config: dict, trainer, efficiency_metrics, timestamp: st
         f.write(f"  AMP: {config['training'].get('use_amp', False)}\n")
         f.write(f"  Gradient Accumulation: {config['training'].get('use_gradient_accumulation', False)}\n")
         f.write(f"  Accumulation Steps: {config['training'].get('accumulation_steps', 1)}\n")
+        f.write(f"  Class Balanced Loss: {config['training'].get('use_class_balanced_loss', True)}\n")
         f.write(f"  Class Balanced Beta: {config['training'].get('cb_beta', 'N/A')}\n\n")
 
         write_common_replay_data_pruning_sections(f, config, pruning_cfg, expansion_cfg, expansion_strategy, validation_cfg)

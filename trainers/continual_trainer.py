@@ -536,6 +536,9 @@ class ContinualLearner:
 
         replay_batches_used = 0
         train_batches_used = 0
+        use_distillation_loss = bool(
+            self.config.get('replay_buffer', {}).get('use_distillation_loss', True)
+        )
 
         if (
             self.pruning_use_replay_for_taylor
@@ -582,7 +585,7 @@ class ContinualLearner:
 
                 replay_loss = F.cross_entropy(replay_logits.float(), replay_labels)
 
-                if replay_batch.get('soft_targets', None) is not None:
+                if use_distillation_loss and replay_batch.get('soft_targets', None) is not None:
                     soft_targets = replay_batch['soft_targets'].to(self.device, non_blocking=True).float()
                     if soft_targets.size(0) == valid_label_mask.size(0):
                         soft_targets = soft_targets[valid_label_mask]
@@ -926,7 +929,12 @@ class ContinualLearner:
         
         self._create_optimizer()
         
-        print("Calculating class counts for Class Balanced Loss")
+        training_cfg = self.config.get('training', {})
+        use_class_balanced_loss = bool(training_cfg.get('use_class_balanced_loss', True))
+        if use_class_balanced_loss:
+            print("Calculating class counts for Class Balanced Loss")
+        else:
+            print("Class Balanced Loss disabled; using standard cross entropy")
         num_classes = int(
             getattr(self.model.fc, 'out_features', self.config['benchmark'].get('total_classes', 7))
         )
@@ -969,14 +977,17 @@ class ContinualLearner:
                 f"but classifier outputs only {num_classes} classes."
             )
         
-        self.criterion = ClassBalancedLoss(
-            class_counts=class_counts,
-            beta=self.config['training'].get('cb_beta', 0.9999)
-        ).to(self.device)
-        
         benchmark_name = str(self.config.get('benchmark', {}).get('name', '')).strip().lower()
-        if benchmark_name == 'clad-c' and hasattr(self.criterion, 'weights') and self.criterion.weights.numel() > 0:
-            self.criterion.weights[0] = 0.0
+        if use_class_balanced_loss:
+            self.criterion = ClassBalancedLoss(
+                class_counts=class_counts,
+                beta=training_cfg.get('cb_beta', 0.9999)
+            ).to(self.device)
+
+            if benchmark_name == 'clad-c' and hasattr(self.criterion, 'weights') and self.criterion.weights.numel() > 0:
+                self.criterion.weights[0] = 0.0
+        else:
+            self.criterion = None
             
         all_test_datasets = []
         for tid in range(task_id + 1):
@@ -1157,6 +1168,7 @@ class ContinualLearner:
         replay_enabled = bool(replay_config.get('enabled', True))
         replay_batch_size = max(1, int(replay_config.get('replay_batch_size', 32)))
         replay_interval_batches = max(1, int(replay_config.get('replay_interval_batches', 1)))
+        use_distillation_loss = bool(replay_config.get('use_distillation_loss', True))
         replay_buffer_len = len(self.replay_buffer) if replay_enabled else 0
         has_replay_data = replay_enabled and replay_buffer_len > 0
         criterion = self.criterion
@@ -1347,7 +1359,7 @@ class ContinualLearner:
 
                     loss += 0.5 * F.cross_entropy(r_out.float(), r_lbls)
 
-                    if replay_batch['soft_targets'] is not None:
+                    if use_distillation_loss and replay_batch['soft_targets'] is not None:
                         soft_targets = replay_batch['soft_targets'].to(self.device, non_blocking=True).float()
 
                         # Re-use replay logits from the fused/current replay forward when dimensions match.
@@ -1441,8 +1453,10 @@ class ContinualLearner:
         
         all_images = torch.cat(collected_data['images'], dim=0)
         all_labels = torch.cat(collected_data['labels'], dim=0)
-        
-        if 'logits' in collected_data and len(collected_data['logits']) > 0:
+        soft_targets = None
+        use_soft_targets = bool(self.config.get('replay_buffer', {}).get('use_soft_targets', True))
+
+        if use_soft_targets and 'logits' in collected_data and len(collected_data['logits']) > 0:
             all_logits = torch.cat(collected_data['logits'], dim=0)
             finite_logits_mask = torch.isfinite(all_logits).all(dim=1)
             finite_count = int(finite_logits_mask.sum().item())
@@ -1462,7 +1476,7 @@ class ContinualLearner:
                 all_labels = all_labels[finite_logits_mask]
                 all_logits = all_logits[finite_logits_mask]
             soft_targets = F.softmax(all_logits.float() / self.replay_buffer.distillation_temp, dim=1)
-        else:
+        elif use_soft_targets:
             print("Computing logits (fallback)")
             module_training_modes = {module: module.training for module in self.model.modules()}
             self.model.eval()

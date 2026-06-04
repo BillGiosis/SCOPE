@@ -135,6 +135,8 @@ def write_common_replay_data_pruning_sections(
     if 'samples_per_class' in config['replay_buffer']:
         f.write(f"  Samples Per Class: {config['replay_buffer'].get('samples_per_class', 'N/A')}\n")
     f.write(f"  Distillation Temp: {config['replay_buffer']['distillation_temp']}\n")
+    f.write(f"  Soft Targets: {config['replay_buffer'].get('use_soft_targets', True)}\n")
+    f.write(f"  Distillation Loss: {config['replay_buffer'].get('use_distillation_loss', True)}\n")
     f.write(f"  Replay Batch Size: {config['replay_buffer']['replay_batch_size']}\n")
     f.write(f"  Replay Interval Batches: {config['replay_buffer'].get('replay_interval_batches', 1)}\n")
     f.write(f"  Auto Distill End Of Task: {config['replay_buffer'].get('auto_distill_end_of_task', True)}\n")

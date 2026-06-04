@@ -19,12 +19,15 @@ training:
   weight_decay: 0.01
   use_amp: true
 
+  use_class_balanced_loss: true
   cb_beta: 0.9999
 
 replay_buffer:
   enabled: true
   max_size: 5000
   distillation_temp: 1.5
+  use_soft_targets: true
+  use_distillation_loss: true
   replay_batch_size: 32
   replay_interval_batches: 2
   auto_distill_end_of_task: true

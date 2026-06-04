@@ -27,12 +27,15 @@ training:
   accumulation_steps: 4  # Effective batch size = batch_size * accumulation_steps
 
   # Class-Balanced Loss
+  use_class_balanced_loss: false
   cb_beta: 0.9999  # Class-balanced loss beta
 
 replay_buffer:
   enabled: true  # Enable/disable replay buffer
   max_size: 1000  # CLAD-C challenge limit
   distillation_temp: 1.5
+  use_soft_targets: true
+  use_distillation_loss: true
   replay_batch_size: 32
   auto_distill_end_of_task: true  # Distill automatically at each task boundary
   end_of_task_distill_compression_ratio: 0.90  # Keep top 90% by entropy importance
