@@ -9,7 +9,6 @@ import torch
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from benchmarks.bddc import create_bddc_benchmark
-from utils.constants import BDDC_INPUT_SIZE
 from utils.experiment import (
     configure_torch_runtime,
     create_model_from_config,
@@ -17,7 +16,6 @@ from utils.experiment import (
     create_trainer_from_config,
     load_config,
     make_timestamp,
-    run_efficiency_metrics,
     save_final_checkpoints,
 )
 from utils.reports_bddc import write_bddc_results
@@ -32,14 +30,14 @@ def main(args):
     config['training']['accumulation_steps'] = 1
 
     expansion_cfg = config.get('network_expansion', {})
-    pruning_cfg = config.get('network_pruning', {})
+    reallocation_cfg = config.get('parameter_reallocation', {})
     model_cfg = config.get('model', {})
     expansion_strategy = str(expansion_cfg.get('strategy', 'all_layers')).strip().lower()
 
     print(f"Configuration loaded from {args.config}")
     print(f"Adapt Downsample Blocks: {model_cfg.get('adapt_downsample_blocks', True)}")
     print(f"Network Expansion Strategy: {expansion_strategy}")
-    print(f"Network Pruning Enabled: {pruning_cfg.get('enabled', False)}")
+    print(f"Parameter Reallocation Enabled: {reallocation_cfg.get('enabled', False)}")
     print(f"Device: {args.device}")
 
     print("\nLoading BDD-C benchmark")
@@ -83,21 +81,13 @@ def main(args):
         train_loader = benchmark.get_task_dataloader(task_id, train=True)
         trainer.train_task(task_id, train_loader, test_loaders)
 
-    efficiency_metrics = run_efficiency_metrics(
-        config,
-        trainer.model,
-        device=args.device,
-        loaders=test_loaders,
-        fallback_shape=(1, 3, 224, 224)
-    )
-
     print(f"\n{'=' * 60}")
     print("Training complete. Final summary:")
     print(f"{'=' * 60}\n")
     trainer.metrics.print_summary(num_tasks - 1)
 
     timestamp = make_timestamp()
-    results_file = write_bddc_results(config, trainer, efficiency_metrics, timestamp)
+    results_file = write_bddc_results(config, trainer, timestamp)
     print(f"\nFinal metrics saved to: {results_file}")
 
     save_final_checkpoints(

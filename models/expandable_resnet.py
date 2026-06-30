@@ -253,35 +253,7 @@ class ExpandableResNet(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     def get_effective_num_parameters(self):
-        """
-        Count parameters that remain active after pruning.
-
-        If torch.nn.utils.prune is applied, parameters are represented as
-        <name>_orig with a corresponding <name>_mask buffer. We count only
-        mask entries equal to 1 for those tensors. For regular (unmasked)
-        parameters we count full tensor size, so naturally-zero values are not
-        misinterpreted as pruned capacity.
-        """
-        total = 0
-
-        for module in self.modules():
-            for name, param in module.named_parameters(recurse=False):
-                if name.endswith('_orig'):
-                    base_name = name[:-5]
-                    mask_name = f"{base_name}_mask"
-                    if hasattr(module, mask_name):
-                        mask = getattr(module, mask_name)
-                        total += int(mask.sum().item())
-                    else:
-                        total += param.numel()
-                    continue
-
-                if name.endswith('_mask'):
-                    continue
-
-                total += param.numel()
-
-        return int(total)
+        return self.get_num_parameters()
 
 
 def create_expandable_resnet(

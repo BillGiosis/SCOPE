@@ -1,6 +1,6 @@
 """Shared result-report helpers."""
 
-from trainers.pruning_policy import PRUNING_SAFEGUARDS
+from trainers.reallocation_policy import REALLOCATION_SAFEGUARDS
 
 
 def avg(values):
@@ -11,30 +11,19 @@ def task_label(task_id: int) -> int:
     return int(task_id) + 1
 
 
-def write_pruning_safeguards(f):
-    f.write(f"  Rebuild Optimizer After Prune: {PRUNING_SAFEGUARDS['rebuild_optimizer_after_prune']}\n")
-    f.write(f"  Recompile After Prune: {PRUNING_SAFEGUARDS['recompile_after_prune']}\n")
-    f.write(f"  Protect Current-Task Adapters: {PRUNING_SAFEGUARDS['protect_current_task_adapters']}\n")
-    f.write(f"  Protect Classifier: {PRUNING_SAFEGUARDS['protect_classifier']}\n")
-    f.write(f"  Protect Downsample: {PRUNING_SAFEGUARDS['protect_downsample']}\n")
+def write_reallocation_safeguards(f):
+    f.write(f"  Rebuild Optimizer After Reallocation: {REALLOCATION_SAFEGUARDS['rebuild_optimizer_after_reallocation']}\n")
+    f.write(f"  Recompile After Reallocation: {REALLOCATION_SAFEGUARDS['recompile_after_reallocation']}\n")
+    f.write(f"  Protect Current-Task Adapters: {REALLOCATION_SAFEGUARDS['protect_current_task_adapters']}\n")
+    f.write(f"  Protect Classifier: {REALLOCATION_SAFEGUARDS['protect_classifier']}\n")
+    f.write(f"  Protect Downsample: {REALLOCATION_SAFEGUARDS['protect_downsample']}\n")
 
 
-def write_efficiency_metrics(f, efficiency_metrics):
-    if efficiency_metrics is None:
-        return
-    f.write(f"Approx MACs: {int(efficiency_metrics['macs']):,}\n")
-    f.write(f"Approx FLOPs: {int(efficiency_metrics['flops']):,}\n")
-    f.write(f"Inference Device: {efficiency_metrics['device']}\n")
-    f.write(f"Inference Input Shape: {efficiency_metrics['input_shape']}\n")
-    f.write(f"Inference Latency: {efficiency_metrics['latency_ms']:.3f} ms\n")
-    f.write(f"Inference Throughput: {efficiency_metrics['throughput_fps']:.2f} FPS\n")
-
-
-def write_pruning_history(f, trainer, num_tasks: int):
-    f.write("\nNetwork Pruning Per Task:\n")
-    pruning_by_task = {entry['task_id']: entry for entry in trainer.pruning_history}
+def write_reallocation_history(f, trainer, num_tasks: int):
+    f.write("\nParameter Reallocation Per Task:\n")
+    reallocation_by_task = {entry['task_id']: entry for entry in trainer.reallocation_history}
     for task_id in range(num_tasks):
-        entry = pruning_by_task.get(task_id)
+        entry = reallocation_by_task.get(task_id)
         if not entry:
             f.write(f"  Task {task_label(task_id)}: none\n")
             continue
@@ -48,10 +37,10 @@ def write_pruning_history(f, trainer, num_tasks: int):
         else:
             amount_text = f"amount={entry['amount']:.4f}"
         f.write(
-            f"  Task {task_label(task_id)}: pruned={entry['pruned_params']:,}, "
+            f"  Task {task_label(task_id)}: reallocated={entry['reallocated_params']:,}, "
             f"capacity={capacity_before:,}->{capacity_after:,}, "
             f"{amount_text}, scope={entry['scope']}, "
-            f"method={entry.get('method', 'unstructured')}, "
+            f"method={entry.get('method', 'structural')}, "
             f"importance={entry.get('importance', 'n/a')}\n"
         )
 
@@ -121,13 +110,12 @@ def write_group_amca_summary(f, trainer, metric_groups):
                 f.write(f"    {group_value}: N/A\n")
 
 
-def write_common_replay_data_pruning_sections(
+def write_common_replay_data_reallocation_sections(
     f,
     config: dict,
-    pruning_cfg: dict,
+    reallocation_cfg: dict,
     expansion_cfg: dict,
-    expansion_strategy: str,
-    validation_cfg: dict
+    expansion_strategy: str
 ):
     f.write("Replay Buffer:\n")
     f.write(f"  Replay Buffer Enabled: {config['replay_buffer'].get('enabled', True)}\n")
@@ -159,29 +147,25 @@ def write_common_replay_data_pruning_sections(
         f.write("  Layer Allocation: budget-aware even distribution across all 4 layers\n")
     f.write("\n")
 
-    f.write("Network Pruning:\n")
-    f.write(f"  Enabled: {pruning_cfg.get('enabled', False)}\n")
-    f.write(f"  Non-Hybrid Amount: {pruning_cfg.get('amount', 0.0)}\n")
-    f.write(f"  Warmup Tasks: {pruning_cfg.get('warmup_tasks', 2)}\n")
-    f.write(f"  Scope: {pruning_cfg.get('scope', 'whole_model')}\n")
-    f.write(f"  Method: {pruning_cfg.get('method', 'structural')}\n")
-    hybrid_cfg = pruning_cfg.get('hybrid', {})
+    f.write("Parameter Reallocation:\n")
+    f.write(f"  Enabled: {reallocation_cfg.get('enabled', False)}\n")
+    f.write(f"  Non-Hybrid Amount: {reallocation_cfg.get('amount', 0.0)}\n")
+    f.write(f"  Warmup Tasks: {reallocation_cfg.get('warmup_tasks', 2)}\n")
+    f.write(f"  Scope: {reallocation_cfg.get('scope', 'whole_model')}\n")
+    hybrid_cfg = reallocation_cfg.get('hybrid', {})
     f.write(f"  Hybrid Whole Model Amount: {hybrid_cfg.get('whole_model_amount', 'N/A')}\n")
     f.write(f"  Hybrid Adapter Amount: {hybrid_cfg.get('adapter_amount', 'N/A')}\n")
     f.write(f"  Hybrid Adapter Scope: {hybrid_cfg.get('adapter_scope', 'N/A')}\n")
-    f.write(f"  Importance: {pruning_cfg.get('importance', 'magnitude')}\n")
-    f.write(f"  Use Replay For Taylor: {pruning_cfg.get('use_replay_for_taylor', True)}\n")
-    f.write(f"  Taylor Replay Batches: {pruning_cfg.get('taylor_replay_batches', 2)}\n")
-    f.write(f"  Taylor Train Batches: {pruning_cfg.get('taylor_train_batches', 0)}\n")
-    f.write(f"  Taylor Replay Batch Size: {pruning_cfg.get('taylor_replay_batch_size', config['replay_buffer'].get('replay_batch_size', 32))}\n")
-    write_pruning_safeguards(f)
-    recovery_cfg = pruning_cfg.get('recovery', {})
+    f.write(f"  Importance: {reallocation_cfg.get('importance', 'magnitude')}\n")
+    f.write(f"  Use Replay For Taylor: {reallocation_cfg.get('use_replay_for_taylor', True)}\n")
+    f.write(f"  Taylor Replay Batches: {reallocation_cfg.get('taylor_replay_batches', 2)}\n")
+    f.write(f"  Taylor Train Batches: {reallocation_cfg.get('taylor_train_batches', 0)}\n")
+    f.write(f"  Taylor Replay Batch Size: {reallocation_cfg.get('taylor_replay_batch_size', config['replay_buffer'].get('replay_batch_size', 32))}\n")
+    write_reallocation_safeguards(f)
+    recovery_cfg = reallocation_cfg.get('recovery', {})
     f.write(f"  Recovery Enabled: {recovery_cfg.get('enabled', True)}\n")
     f.write(f"  Recovery Epochs: {recovery_cfg.get('epochs', 2)}\n")
-    f.write(f"  Recovery LR Scale: {recovery_cfg.get('learning_rate_scale', 0.25)}\n")
-    f.write(f"  Report Efficiency Metrics: {validation_cfg.get('report_efficiency_metrics', True)}\n")
-    f.write(f"  Latency Warmup Runs: {validation_cfg.get('latency_warmup_runs', 5)}\n")
-    f.write(f"  Latency Runs: {validation_cfg.get('latency_runs', 20)}\n\n")
+    f.write(f"  Recovery LR Scale: {recovery_cfg.get('learning_rate_scale', 0.25)}\n\n")
 
     f.write("Logging:\n")
     f.write(f"  Save Dir: {config['logging']['save_dir']}\n\n")
@@ -231,12 +215,11 @@ def write_per_class_history(f, trainer, num_tasks: int, class_names):
     f.write("\n")
 
 
-def write_model_stats(f, trainer, efficiency_metrics, total_time: float):
+def write_model_stats(f, trainer, total_time: float):
     if trainer.metrics.memory_usage:
         f.write(f"Final Memory Usage: {trainer.metrics.memory_usage[-1]:.2f} MB\n")
     if trainer.metrics.num_parameters:
         f.write(f"Final Parameters: {trainer.metrics.num_parameters[-1]:,}\n")
-    write_efficiency_metrics(f, efficiency_metrics)
     f.write(f"Total Training Time: {total_time:.2f} seconds ({total_time / 3600:.2f} hours)\n\n")
 
 

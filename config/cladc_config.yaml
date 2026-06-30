@@ -49,13 +49,11 @@ network_expansion:
   enabled: true
   strategy: "layer2_layer3_split"  # Options: "all_layers" or "layer2_layer3_split"
 
-network_pruning:
+parameter_reallocation:
   enabled: true
   amount: 0.05  # Used only when scope is not "hybrid"; hybrid uses the amounts below.
-  warmup_tasks: 2  # Do not prune during first N tasks to protect early AMCA
+  warmup_tasks: 2  # Do not run reallocation during first N tasks to protect early AMCA
   scope: "hybrid"  # Options: "whole_model", "older_adapters_only", "all_adapters", or "hybrid"
-  # hybrid: gentle structural whole-model squeeze + safer adapter cleanup
-  method: "structural"  # Options: "structural" (torch-pruning) or "unstructured"
   hybrid:
     whole_model_amount: 0.01
     adapter_amount: 0.40
@@ -69,10 +67,6 @@ network_pruning:
     enabled: true
     epochs: 5
     learning_rate_scale: 0.2
-  validation:
-    report_efficiency_metrics: true
-    latency_warmup_runs: 5
-    latency_runs: 20
 
 logging:
   save_dir: "./checkpoints/cladc"

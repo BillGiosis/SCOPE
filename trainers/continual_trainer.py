@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.nn.utils.prune as torch_prune
 import copy
 from torch.utils.data import DataLoader, ConcatDataset
 from typing import Dict, List, Optional
@@ -24,11 +23,11 @@ from utils.metrics import (
     compute_model_size
 )
 from utils.losses import ClassBalancedLoss
-from trainers.pruning_policy import (
+from trainers.reallocation_policy import (
     PROTECT_CLASSIFIER,
     PROTECT_CURRENT_TASK_ADAPTERS,
     PROTECT_DOWNSAMPLE,
-    RECOMPILE_AFTER_PRUNE,
+    RECOMPILE_AFTER_REALLOCATION,
 )
 
 
@@ -100,26 +99,25 @@ class ContinualLearner:
         self.expansion_strategy = str(expansion_cfg.get('strategy', 'all_layers')).strip().lower()
         self.expansion_layer_order = self._resolve_expansion_layers(self.expansion_strategy)
 
-        pruning_cfg = config.get('network_pruning', {})
-        self.pruning_enabled = pruning_cfg.get('enabled', False)
-        self.pruning_amount = float(pruning_cfg.get('amount', 0.0))
-        self.pruning_scope = str(pruning_cfg.get('scope', 'whole_model')).strip().lower()
-        self.pruning_method = str(pruning_cfg.get('method', 'structural')).strip().lower()
-        self.pruning_importance = str(pruning_cfg.get('importance', 'magnitude')).strip().lower()
-        self.pruning_use_replay_for_taylor = bool(pruning_cfg.get('use_replay_for_taylor', True))
-        self.pruning_taylor_replay_batches = max(0, int(pruning_cfg.get('taylor_replay_batches', 2)))
-        self.pruning_taylor_train_batches = max(0, int(pruning_cfg.get('taylor_train_batches', 1)))
-        self.pruning_taylor_replay_batch_size = max(
+        reallocation_cfg = config.get('parameter_reallocation', {})
+        self.reallocation_enabled = reallocation_cfg.get('enabled', False)
+        self.reallocation_amount = float(reallocation_cfg.get('amount', 0.0))
+        self.reallocation_scope = str(reallocation_cfg.get('scope', 'whole_model')).strip().lower()
+        self.reallocation_importance = str(reallocation_cfg.get('importance', 'magnitude')).strip().lower()
+        self.reallocation_use_replay_for_taylor = bool(reallocation_cfg.get('use_replay_for_taylor', True))
+        self.reallocation_taylor_replay_batches = max(0, int(reallocation_cfg.get('taylor_replay_batches', 2)))
+        self.reallocation_taylor_train_batches = max(0, int(reallocation_cfg.get('taylor_train_batches', 1)))
+        self.reallocation_taylor_replay_batch_size = max(
             1,
             int(
-                pruning_cfg.get(
+                reallocation_cfg.get(
                     'taylor_replay_batch_size',
                     config.get('replay_buffer', {}).get('replay_batch_size', 32)
                 )
             )
         )
-        self.pruning_warmup_tasks = max(0, int(pruning_cfg.get('warmup_tasks', 2)))
-        hybrid_cfg = pruning_cfg.get('hybrid', {})
+        self.reallocation_warmup_tasks = max(0, int(reallocation_cfg.get('warmup_tasks', 2)))
+        hybrid_cfg = reallocation_cfg.get('hybrid', {})
         self.hybrid_whole_model_amount = float(hybrid_cfg.get('whole_model_amount', 0.01))
         self.hybrid_adapter_amount = float(hybrid_cfg.get('adapter_amount', 0.20))
         self.hybrid_adapter_scope = str(
@@ -127,16 +125,15 @@ class ContinualLearner:
         ).strip().lower()
         if (
             self.use_torch_compile
-            and self.pruning_enabled
-            and self.pruning_scope in {'whole_model', 'hybrid'}
-            and self.pruning_method == 'structural'
+            and self.reallocation_enabled
+            and self.reallocation_scope in {'whole_model', 'hybrid'}
         ):
             try:
                 import torch._dynamo as dynamo
                 dynamo.config.force_parameter_static_shapes = False
                 print(
                     "Enabled dynamic parameter shapes for torch.compile "
-                    "(structural pruning is active)."
+                    "(structural reallocation is active)."
                 )
             except Exception as e:
                 print(
@@ -144,27 +141,27 @@ class ContinualLearner:
                     f"{e}"
                 )
 
-        recovery_cfg = pruning_cfg.get('recovery', {})
-        self.prune_recovery_enabled = bool(recovery_cfg.get('enabled', True))
-        self.prune_recovery_epochs = max(0, int(recovery_cfg.get('epochs', 4)))
-        self.prune_recovery_lr_scale = float(recovery_cfg.get('learning_rate_scale', 0.2))
+        recovery_cfg = reallocation_cfg.get('recovery', {})
+        self.reallocation_recovery_enabled = bool(recovery_cfg.get('enabled', True))
+        self.reallocation_recovery_epochs = max(0, int(recovery_cfg.get('epochs', 4)))
+        self.reallocation_recovery_lr_scale = float(recovery_cfg.get('learning_rate_scale', 0.2))
 
-        self.pruning_amount = min(max(self.pruning_amount, 0.0), 1.0)
+        self.reallocation_amount = min(max(self.reallocation_amount, 0.0), 1.0)
         self.hybrid_whole_model_amount = min(max(self.hybrid_whole_model_amount, 0.0), 1.0)
         self.hybrid_adapter_amount = min(max(self.hybrid_adapter_amount, 0.0), 1.0)
         if self.hybrid_adapter_scope not in {'older_adapters_only', 'all_adapters'}:
             print(
-                f"[WARNING] Unsupported network_pruning.hybrid.adapter_scope='{self.hybrid_adapter_scope}'. "
+                f"[WARNING] Unsupported parameter_reallocation.hybrid.adapter_scope='{self.hybrid_adapter_scope}'. "
                 "Falling back to 'older_adapters_only'."
             )
             self.hybrid_adapter_scope = 'older_adapters_only'
-        if self.pruning_importance not in {'magnitude', 'taylor'}:
+        if self.reallocation_importance not in {'magnitude', 'taylor'}:
             print(
-                f"[WARNING] Unsupported network_pruning.importance='{self.pruning_importance}'. "
+                f"[WARNING] Unsupported parameter_reallocation.importance='{self.reallocation_importance}'. "
                 "Falling back to 'magnitude'."
             )
-            self.pruning_importance = 'magnitude'
-        self.prune_recovery_lr_scale = max(self.prune_recovery_lr_scale, 0.0)
+            self.reallocation_importance = 'magnitude'
+        self.reallocation_recovery_lr_scale = max(self.reallocation_recovery_lr_scale, 0.0)
 
         base_params = int(self._get_effective_model_params())
         max_ratio = float(config.get('benchmark', {}).get('max_params_ratio', 1.05))
@@ -175,7 +172,7 @@ class ContinualLearner:
         
         self.task_expansions = {}
         self.expansion_history = []
-        self.pruning_history = []
+        self.reallocation_history = []
         self.current_task_new_adapter_ids = set()
         self.last_taylor_gradient_stats = {
             'replay_batches': 0,
@@ -192,11 +189,11 @@ class ContinualLearner:
         """Return the user-facing 1-indexed task number."""
         return int(task_id) + 1
 
-    def _is_pruning_task(self, task_id: int) -> bool:
-        """Return whether pruning should run for this task id after warmup."""
-        if not self.pruning_enabled:
+    def _is_reallocation_task(self, task_id: int) -> bool:
+        """Return whether reallocation should run for this task id after warmup."""
+        if not self.reallocation_enabled:
             return False
-        return task_id >= self.pruning_warmup_tasks
+        return task_id >= self.reallocation_warmup_tasks
 
     def _resolve_expansion_layers(self, strategy: str) -> List[str]:
         """Resolve configured strategy into an expansion layer schedule."""
@@ -229,7 +226,7 @@ class ContinualLearner:
         """
         Count active model parameters for budget checks.
 
-        When pruning masks are present, masked-out parameters are excluded.
+        When reallocation masks are present, masked-out parameters are excluded.
         """
         if hasattr(self.model, 'get_effective_num_parameters'):
             return int(self.model.get_effective_num_parameters())
@@ -270,19 +267,19 @@ class ContinualLearner:
 
         return int(sum(costs))
 
-    def _resolve_prune_amount(
+    def _resolve_reallocation_amount(
         self,
-        prunable_effective_params: int,
+        reallocatable_effective_params: int,
         task_id: int
     ) -> float:
-        """Resolve pruning amount with fixed (non-budget-driven) behavior."""
+        """Resolve reallocation amount with fixed (non-budget-driven) behavior."""
         del task_id
 
-        configured_amount = min(max(float(self.pruning_amount), 0.0), 1.0)
+        configured_amount = min(max(float(self.reallocation_amount), 0.0), 1.0)
         if configured_amount <= 0.0:
             return 0.0
 
-        if prunable_effective_params <= 0:
+        if reallocatable_effective_params <= 0:
             return 0.0
 
         return configured_amount
@@ -413,8 +410,8 @@ class ContinualLearner:
             is_new_adapter = id(adapter) in self.current_task_new_adapter_ids
             adapter.train(bool(is_new_adapter))
 
-    def _get_pruning_example_input(self, train_loader: Optional[DataLoader] = None) -> Optional[torch.Tensor]:
-        """Build example input for graph-based structural pruning."""
+    def _get_reallocation_example_input(self, train_loader: Optional[DataLoader] = None) -> Optional[torch.Tensor]:
+        """Build example input for graph-based structural reallocation."""
         if train_loader is not None:
             try:
                 first_batch = next(iter(train_loader))
@@ -434,7 +431,7 @@ class ContinualLearner:
                         example = example.contiguous(memory_format=torch.channels_last)
                     return example
             except Exception as e:
-                print(f"[WARNING] Could not derive pruning example input from loader: {e}")
+                print(f"[WARNING] Could not derive reallocation example input from loader: {e}")
 
         try:
             # Normal path uses one sample from train_loader; fallback matches
@@ -445,11 +442,11 @@ class ContinualLearner:
                 example = example.contiguous(memory_format=torch.channels_last)
             return example
         except Exception as e:
-            print(f"[WARNING] Could not create fallback pruning example input: {e}")
+            print(f"[WARNING] Could not create fallback reallocation example input: {e}")
             return None
 
-    def _collect_structural_pruning_ignored_layers(self) -> List[nn.Module]:
-        """Collect strict protection list for structural pruning."""
+    def _collect_structural_reallocation_ignored_layers(self) -> List[nn.Module]:
+        """Collect strict protection list for structural reallocation."""
         ignored_layers = []
         ignored_ids = set()
 
@@ -523,7 +520,7 @@ class ContinualLearner:
             print(f"[WARNING] Could not restore last-good model snapshot: {e}")
             return False
 
-    def _prepare_taylor_gradients_for_pruning(
+    def _prepare_taylor_gradients_for_reallocation(
         self,
         train_loader: Optional[DataLoader] = None
     ) -> bool:
@@ -541,12 +538,12 @@ class ContinualLearner:
         )
 
         if (
-            self.pruning_use_replay_for_taylor
-            and self.pruning_taylor_replay_batches > 0
+            self.reallocation_use_replay_for_taylor
+            and self.reallocation_taylor_replay_batches > 0
             and len(self.replay_buffer) > 0
         ):
-            replay_batch_size = min(self.pruning_taylor_replay_batch_size, len(self.replay_buffer))
-            for _ in range(self.pruning_taylor_replay_batches):
+            replay_batch_size = min(self.reallocation_taylor_replay_batch_size, len(self.replay_buffer))
+            for _ in range(self.reallocation_taylor_replay_batches):
                 replay_batch = self.replay_buffer.get_batch(batch_size=replay_batch_size)
                 if replay_batch is None:
                     break
@@ -604,9 +601,9 @@ class ContinualLearner:
                 replay_loss.backward()
                 replay_batches_used += 1
 
-        if train_loader is not None and self.pruning_taylor_train_batches > 0:
+        if train_loader is not None and self.reallocation_taylor_train_batches > 0:
             for batch_idx, (images, labels) in enumerate(train_loader):
-                if train_batches_used >= self.pruning_taylor_train_batches:
+                if train_batches_used >= self.reallocation_taylor_train_batches:
                     break
 
                 if self.device == 'cuda':
@@ -640,7 +637,7 @@ class ContinualLearner:
                 loss.backward()
                 train_batches_used += 1
 
-                if train_batches_used >= self.pruning_taylor_train_batches:
+                if train_batches_used >= self.reallocation_taylor_train_batches:
                     break
 
         total_batches = replay_batches_used + train_batches_used
@@ -660,11 +657,11 @@ class ContinualLearner:
                 parameter.grad.mul_(scale)
             else:
                 # Ensure every parameter has a gradient tensor so Taylor-based
-                # importance never receives None gradients from torch-pruning.
+                # importance never receives None gradients from the structural dependency.
                 parameter.grad = torch.zeros_like(parameter)
 
         print(
-            "Prepared Taylor gradients for structural pruning: "
+            "Prepared Taylor gradients for structural reallocation: "
             f"replay_batches={replay_batches_used}, "
             f"train_batches={train_batches_used}"
         )
@@ -674,11 +671,11 @@ class ContinualLearner:
         self,
         train_loader: Optional[DataLoader] = None
     ):
-        """Resolve structural pruning importance criterion from config."""
+        """Resolve structural reallocation importance criterion from config."""
         if tp is None:
-            raise RuntimeError("torch-pruning is required for structural importance resolution")
+            raise RuntimeError("The structural reallocation dependency is required for importance resolution")
 
-        if self.pruning_importance != 'taylor':
+        if self.reallocation_importance != 'taylor':
             self.last_taylor_gradient_stats = {
                 'replay_batches': 0,
                 'train_batches': 0,
@@ -686,7 +683,7 @@ class ContinualLearner:
             }
             return tp.importance.MagnitudeImportance(p=1), 'magnitude'
 
-        taylor_ready = self._prepare_taylor_gradients_for_pruning(train_loader=train_loader)
+        taylor_ready = self._prepare_taylor_gradients_for_reallocation(train_loader=train_loader)
         if not taylor_ready:
             print(
                 "[WARNING] Taylor importance requested but no gradients were prepared. "
@@ -700,7 +697,7 @@ class ContinualLearner:
 
         if taylor_cls is None:
             print(
-                "[WARNING] torch-pruning Taylor importance class not found. "
+                "[WARNING] Structural reallocation Taylor importance class not found. "
                 "Falling back to magnitude importance."
             )
             return tp.importance.MagnitudeImportance(p=1), 'magnitude'
@@ -714,13 +711,13 @@ class ContinualLearner:
             )
             return tp.importance.MagnitudeImportance(p=1), 'magnitude'
 
-    def _refresh_training_state_after_prune(
+    def _refresh_training_state_after_reallocation(
         self,
         task_id: int,
         learning_rate: Optional[float] = None,
         scheduler_tmax: Optional[int] = None
     ):
-        """Refresh optimizer and compiled training graph after structural pruning."""
+        """Refresh optimizer and compiled training graph after structural reallocation."""
         expected_num_classes = int(self.config.get('benchmark', {}).get('total_classes', 7))
         self._ensure_classifier_head(expected_num_classes)
 
@@ -728,10 +725,10 @@ class ContinualLearner:
             learning_rate=learning_rate,
             scheduler_tmax=scheduler_tmax
         )
-        print(f"Rebuilt optimizer after pruning for task {self._task_label(task_id)}")
+        print(f"Rebuilt optimizer after reallocation for task {self._task_label(task_id)}")
 
         self.train_model = self.model
-        if RECOMPILE_AFTER_PRUNE and self.use_torch_compile:
+        if RECOMPILE_AFTER_REALLOCATION and self.use_torch_compile:
             try:
                 try:
                     import torch._dynamo as dynamo
@@ -739,9 +736,9 @@ class ContinualLearner:
                 except Exception:
                     pass
                 self.train_model = torch.compile(self.model)
-                print(f"Recompiled training model after pruning for task {self._task_label(task_id)}")
+                print(f"Recompiled training model after reallocation for task {self._task_label(task_id)}")
             except Exception as e:
-                print(f"Could not recompile training model after pruning for task {self._task_label(task_id)}: {e}")
+                print(f"Could not recompile training model after reallocation for task {self._task_label(task_id)}: {e}")
                 self.train_model = self.model
 
     def _prepare_training_model_for_task(self, task_id: int):
@@ -1062,10 +1059,10 @@ class ContinualLearner:
                 )
                 task_progress_bar.update(1)
                 
-                # Evaluate only at task end. When pruning can mutate the model
+                # Evaluate only at task end. When reallocation can mutate the model
                 # after the epoch, defer metric recording until the final model
                 # state is known.
-                if is_last_epoch and not self._is_pruning_task(task_id):
+                if is_last_epoch and not self._is_reallocation_task(task_id):
                     print(f"\nEpoch {epoch + 1}/{self.epochs_per_task} - Evaluating")
                     last_eval_snapshot = self._evaluate_and_update_metrics(
                         task_id,
@@ -1085,10 +1082,10 @@ class ContinualLearner:
 
         self._auto_distill_replay_buffer_end_of_task(task_id)
 
-        prune_applied = self._auto_prune_network_end_of_task(task_id, train_loader=train_loader)
-        self._post_prune_recovery(task_id, train_loader, prune_applied)
+        reallocation_applied = self._auto_parameter_reallocation_end_of_task(task_id, train_loader=train_loader)
+        self._post_reallocation_recovery(task_id, train_loader, reallocation_applied)
 
-        if not prune_applied and last_eval_snapshot is not None:
+        if not reallocation_applied and last_eval_snapshot is not None:
             print(
                 f"\nFinal evaluation after task {self._task_label(task_id)}: "
                 "reusing latest epoch metrics (no post-train model change)."
@@ -1577,32 +1574,32 @@ class ContinualLearner:
         except Exception as e:
             print(f"[WARNING] Auto replay-buffer distillation failed after task {self._task_label(task_id)}: {e}")
 
-    def _post_prune_recovery(self, task_id: int, train_loader: DataLoader, prune_applied: bool):
-        """Run a short recovery fine-tuning phase after pruning to stabilize accuracy."""
-        if not prune_applied:
+    def _post_reallocation_recovery(self, task_id: int, train_loader: DataLoader, reallocation_applied: bool):
+        """Run a short recovery fine-tuning phase after reallocation to stabilize accuracy."""
+        if not reallocation_applied:
             return
 
-        recovery_lr = max(self.learning_rate * self.prune_recovery_lr_scale, 1e-8)
-        recovery_tmax = max(1, self.prune_recovery_epochs)
+        recovery_lr = max(self.learning_rate * self.reallocation_recovery_lr_scale, 1e-8)
+        recovery_tmax = max(1, self.reallocation_recovery_epochs)
 
-        self._refresh_training_state_after_prune(
+        self._refresh_training_state_after_reallocation(
             task_id=task_id,
             learning_rate=recovery_lr,
             scheduler_tmax=recovery_tmax
         )
 
-        if not self.prune_recovery_enabled:
+        if not self.reallocation_recovery_enabled:
             return
-        if self.prune_recovery_epochs <= 0:
+        if self.reallocation_recovery_epochs <= 0:
             return
 
-        print(f"\n--- Post-Prune Recovery (Task {self._task_label(task_id)}) ---")
+        print(f"\n--- Post-Reallocation Recovery (Task {self._task_label(task_id)}) ---")
         print(
-            f"Recovery epochs={self.prune_recovery_epochs}, "
+            f"Recovery epochs={self.reallocation_recovery_epochs}, "
             f"learning_rate={recovery_lr:.6g}"
         )
 
-        for recovery_epoch in range(self.prune_recovery_epochs):
+        for recovery_epoch in range(self.reallocation_recovery_epochs):
             display_epoch = self.epochs_per_task + recovery_epoch
             self._train_epoch(
                 task_id=task_id,
@@ -1611,12 +1608,12 @@ class ContinualLearner:
                 collection_dict=None
             )
 
-        print("Post-prune recovery complete")
+        print("Post-reallocation recovery complete")
 
-    def _collect_prunable_adapter_candidates(self) -> List[Dict]:
+    def _collect_reallocatable_adapter_candidates(self) -> List[Dict]:
         """Collect removable adapter candidates with optional AMCA-aware Taylor scoring."""
         candidates = []
-        use_taylor_scoring = (self.pruning_importance == 'taylor')
+        use_taylor_scoring = (self.reallocation_importance == 'taylor')
 
         for layer_name in ["layer1", "layer2", "layer3", "layer4"]:
             if not hasattr(self.model, layer_name):
@@ -1632,14 +1629,14 @@ class ContinualLearner:
                     is_new_adapter = adapter_id in self.current_task_new_adapter_ids
                     if PROTECT_CURRENT_TASK_ADAPTERS and is_new_adapter:
                         continue
-                    if self.pruning_scope == 'older_adapters_only' and is_new_adapter:
+                    if self.reallocation_scope == 'older_adapters_only' and is_new_adapter:
                         continue
 
                     adapter_params = int(sum(p.numel() for p in adapter.parameters()))
                     if adapter_params <= 0:
                         continue
 
-                    # Lower score means lower importance and thus higher prune priority.
+                    # Lower score means lower importance and thus higher reallocation priority.
                     score = 0.0
                     for p in adapter.parameters():
                         if use_taylor_scoring and p.grad is not None:
@@ -1657,9 +1654,9 @@ class ContinualLearner:
 
         return candidates
 
-    def _collect_prunable_dense_parameters(self) -> List[tuple]:
+    def _collect_reallocatable_dense_parameters(self) -> List[tuple]:
         """
-        Collect Conv/Linear weights across the whole model for magnitude pruning.
+        Collect Conv/Linear weights across the whole model for magnitude reallocation.
 
         Current-task adapters are excluded so freshly introduced task adapters
         remain untouched at this task boundary.
@@ -1672,7 +1669,7 @@ class ContinualLearner:
                 for m in adapter.modules():
                     protected_module_ids.add(id(m))
 
-        modules_to_prune = []
+        modules_to_reallocate = []
         classifier_module = getattr(self.model, 'fc', None) if PROTECT_CLASSIFIER else None
         for module_name, module in self.model.named_modules():
             if not isinstance(module, (nn.Conv2d, nn.Linear)):
@@ -1700,19 +1697,12 @@ class ContinualLearner:
             if PROTECT_DOWNSAMPLE and 'downsample' in module_name:
                 continue
 
-            modules_to_prune.append((module, 'weight'))
+            modules_to_reallocate.append((module, 'weight'))
 
-        return modules_to_prune
+        return modules_to_reallocate
 
     def _get_effective_entries_for_parameter(self, module: nn.Module, param_name: str) -> int:
-        """Count active entries for one potentially pruned parameter tensor."""
-        orig_name = f"{param_name}_orig"
-        mask_name = f"{param_name}_mask"
-
-        if hasattr(module, orig_name) and hasattr(module, mask_name):
-            mask = getattr(module, mask_name)
-            return int(mask.sum().item())
-
+        """Count active entries for one potentially reallocated parameter tensor."""
         if hasattr(module, param_name):
             tensor = getattr(module, param_name)
             if isinstance(tensor, nn.Parameter):
@@ -1722,100 +1712,61 @@ class ContinualLearner:
 
         return 0
 
-    def _count_prunable_dense_effective_params(self, modules_to_prune: List[tuple]) -> int:
-        """Count active entries across all dense parameters eligible for pruning."""
+    def _count_reallocatable_dense_effective_params(self, modules_to_reallocate: List[tuple]) -> int:
+        """Count active entries across all dense parameters eligible for reallocation."""
         return int(
             sum(
                 self._get_effective_entries_for_parameter(module, param_name)
-                for module, param_name in modules_to_prune
+                for module, param_name in modules_to_reallocate
             )
         )
 
-    def _prepare_modules_for_unstructured_pruning(self, modules_to_prune: List[tuple]):
-        """
-        Ensure prunable tensors are contiguous so torch prune internals that use
-        view() do not fail on channels-last/non-standard strides.
-        """
-        for module, param_name in modules_to_prune:
-            for attr_name in (param_name, f"{param_name}_orig"):
-                if not hasattr(module, attr_name):
-                    continue
-
-                attr = getattr(module, attr_name)
-                if isinstance(attr, nn.Parameter):
-                    attr.data = attr.data.contiguous()
-                    continue
-
-                if torch.is_tensor(attr):
-                    setattr(module, attr_name, attr.contiguous())
-
-    def _remove_pruning_reparam_if_present(
-        self,
-        modules_to_prune: List[tuple],
-        keep_existing_reparam: Optional[set] = None
-    ):
-        """Best-effort cleanup of pruning reparameterization wrappers."""
-        if keep_existing_reparam is None:
-            keep_existing_reparam = set()
-
-        for module, param_name in modules_to_prune:
-            key = (id(module), param_name)
-            if key in keep_existing_reparam:
-                continue
-            if not hasattr(module, f"{param_name}_orig"):
-                continue
-            try:
-                torch_prune.remove(module, param_name)
-            except Exception:
-                # Keep cleanup best-effort; original prune exception is reported upstream.
-                pass
-
-    def _auto_structural_prune_whole_model(
+    def _auto_structural_reallocation_whole_model(
         self,
         task_id: int,
         train_loader: Optional[DataLoader] = None
     ) -> bool:
-        """Apply physical channel/filter pruning for whole-model mode."""
+        """Apply physical channel/filter reallocation for whole-model mode."""
         if tp is None:
             print(
-                "[WARNING] Structural pruning requested but 'torch_pruning' is not available. "
-                "Install torch-pruning or use network_pruning.method='unstructured'."
+                "[WARNING] Structural reallocation requested but the dependency is not available. "
+                "Install the structural dependency to enable whole-model reallocation."
             )
             return False
 
-        modules_to_prune = self._collect_prunable_dense_parameters()
-        if not modules_to_prune:
+        modules_to_reallocate = self._collect_reallocatable_dense_parameters()
+        if not modules_to_reallocate:
             print(
                 f"No eligible whole-model parameters found at task {self._task_label(task_id)} "
                 "(current-task adapters are protected)."
             )
             return False
 
-        prunable_effective = self._count_prunable_dense_effective_params(modules_to_prune)
-        if prunable_effective <= 0:
-            print(f"No active dense parameters available to prune at task {self._task_label(task_id)}")
+        reallocatable_effective = self._count_reallocatable_dense_effective_params(modules_to_reallocate)
+        if reallocatable_effective <= 0:
+            print(f"No active dense parameters available for reallocation at task {self._task_label(task_id)}")
             return False
 
-        prune_amount = self._resolve_prune_amount(
-            prunable_effective_params=prunable_effective,
+        reallocation_amount = self._resolve_reallocation_amount(
+            reallocatable_effective_params=reallocatable_effective,
             task_id=task_id
         )
-        if prune_amount <= 0.0:
+        if reallocation_amount <= 0.0:
             return False
 
-        example_inputs = self._get_pruning_example_input(train_loader=train_loader)
+        example_inputs = self._get_reallocation_example_input(train_loader=train_loader)
         if example_inputs is None:
-            print(f"[WARNING] No valid example input available for structural pruning at task {self._task_label(task_id)}")
+            print(f"[WARNING] No valid example input available for structural reallocation at task {self._task_label(task_id)}")
             return False
 
-        ignored_layers = self._collect_structural_pruning_ignored_layers()
+        ignored_layers = self._collect_structural_reallocation_ignored_layers()
         before_effective = self._get_effective_model_params()
         before_total = int(self.model.get_num_parameters()) if hasattr(self.model, 'get_num_parameters') else int(sum(p.numel() for p in self.model.parameters()))
-        pre_prune_snapshot = None
+        pre_reallocation_snapshot = None
         try:
-            pre_prune_snapshot = copy.deepcopy(self.model).cpu()
+            pre_reallocation_snapshot = copy.deepcopy(self.model).cpu()
         except Exception as e:
-            print(f"[WARNING] Could not snapshot model before structural pruning at task {self._task_label(task_id)}: {e}")
+            print(f"[WARNING] Could not snapshot model before structural reallocation at task {self._task_label(task_id)}: {e}")
 
         try:
             self.model.eval()
@@ -1825,27 +1776,27 @@ class ContinualLearner:
             importance, importance_name = self._resolve_structural_importance(
                 train_loader=train_loader
             )
-            pruner = tp.pruner.MagnitudePruner(
+            reallocator = tp.pruner.MagnitudePruner(
                 self.model,
                 example_inputs=example_inputs,
                 importance=importance,
-                pruning_ratio=float(prune_amount),
+                pruning_ratio=float(reallocation_amount),
                 ignored_layers=ignored_layers,
             )
 
             try:
-                pruner.step()
-            except Exception as prune_error:
+                reallocator.step()
+            except Exception as reallocation_error:
                 if importance_name == 'taylor':
                     print(
-                        f"[WARNING] Taylor structural pruning failed at task {self._task_label(task_id)}: {prune_error}. "
+                        f"[WARNING] Taylor structural reallocation failed at task {self._task_label(task_id)}: {reallocation_error}. "
                         "Retrying once with magnitude importance."
                     )
 
-                    if pre_prune_snapshot is None:
+                    if pre_reallocation_snapshot is None:
                         raise
 
-                    restored = copy.deepcopy(pre_prune_snapshot).to(self.device)
+                    restored = copy.deepcopy(pre_reallocation_snapshot).to(self.device)
                     if self.device == 'cuda':
                         restored = restored.to(memory_format=torch.channels_last)
                     self.model = restored
@@ -1856,14 +1807,14 @@ class ContinualLearner:
                         _ = self.model(example_inputs)
 
                     fallback_importance = tp.importance.MagnitudeImportance(p=1)
-                    pruner = tp.pruner.MagnitudePruner(
+                    reallocator = tp.pruner.MagnitudePruner(
                         self.model,
                         example_inputs=example_inputs,
                         importance=fallback_importance,
-                        pruning_ratio=float(prune_amount),
+                        pruning_ratio=float(reallocation_amount),
                         ignored_layers=ignored_layers,
                     )
-                    pruner.step()
+                    reallocator.step()
                     importance_name = 'magnitude_fallback'
                 else:
                     raise
@@ -1875,19 +1826,19 @@ class ContinualLearner:
             after_total = int(self.model.get_num_parameters()) if hasattr(self.model, 'get_num_parameters') else int(sum(p.numel() for p in self.model.parameters()))
             capacity_before = int(before_total)
             capacity_after = int(after_total)
-            pruned_now = max(0, capacity_before - capacity_after)
+            reallocated_now = max(0, capacity_before - capacity_after)
 
-            self.pruning_history.append({
+            self.reallocation_history.append({
                 'task_id': int(task_id),
-                'scope': self.pruning_scope,
+                'scope': self.reallocation_scope,
                 'method': 'structural',
-                'amount': float(prune_amount),
+                'amount': float(reallocation_amount),
                 'importance': importance_name,
                 'capacity_params_before': int(capacity_before),
                 'capacity_params_after': int(capacity_after),
                 'effective_params_before': int(before_effective),
                 'effective_params_after': int(after_effective),
-                'pruned_params': int(pruned_now),
+                'reallocated_params': int(reallocated_now),
                 'total_params_before': int(before_total),
                 'total_params_after': int(after_total),
                 'ignored_layers': int(len(ignored_layers)),
@@ -1899,43 +1850,43 @@ class ContinualLearner:
             self.model.zero_grad(set_to_none=True)
 
             print(
-                f"Auto-structural-pruned whole model at end of task {self._task_label(task_id)}: "
-                f"amount={prune_amount:.4f}, ignored_layers={len(ignored_layers)}, "
+                f"Auto-structural-reallocated whole model at end of task {self._task_label(task_id)}: "
+                f"amount={reallocation_amount:.4f}, ignored_layers={len(ignored_layers)}, "
                 f"importance={importance_name}, "
                 f"capacity params {capacity_before:,} -> {capacity_after:,} "
-                f"(freed {pruned_now:,})"
+                f"(freed {reallocated_now:,})"
             )
             return True
         except Exception as e:
-            if pre_prune_snapshot is not None:
+            if pre_reallocation_snapshot is not None:
                 try:
-                    restored = pre_prune_snapshot.to(self.device)
+                    restored = pre_reallocation_snapshot.to(self.device)
                     if self.device == 'cuda':
                         restored = restored.to(memory_format=torch.channels_last)
                     self.model = restored
                     self.train_model = self.model
                     print(
-                        f"[WARNING] Restored pre-prune snapshot after structural pruning failure "
+                        f"[WARNING] Restored pre-reallocation snapshot after structural reallocation failure "
                         f"at task {self._task_label(task_id)}."
                     )
                 except Exception as restore_error:
                     print(
-                        f"[WARNING] Could not restore pre-prune snapshot at task {self._task_label(task_id)}: "
+                        f"[WARNING] Could not restore pre-reallocation snapshot at task {self._task_label(task_id)}: "
                         f"{restore_error}"
                     )
-            print(f"[WARNING] Structural whole-model pruning failed after task {self._task_label(task_id)}: {e}")
+            print(f"[WARNING] Structural whole-model reallocation failed after task {self._task_label(task_id)}: {e}")
             return False
 
     @staticmethod
-    def _combine_hybrid_pruning_entries(task_id: int, entries: List[Dict]) -> Dict:
-        """Collapse the two internal hybrid prune steps into one task-level record."""
+    def _combine_hybrid_reallocation_entries(task_id: int, entries: List[Dict]) -> Dict:
+        """Collapse the two internal hybrid reallocation steps into one task-level record."""
         if not entries:
             return {
                 'task_id': int(task_id),
                 'scope': 'hybrid',
                 'method': 'hybrid',
                 'amount': 0.0,
-                'pruned_params': 0
+                'reallocated_params': 0
             }
 
         first = entries[0]
@@ -1961,11 +1912,11 @@ class ContinualLearner:
             'capacity_params_after': int(last.get('capacity_params_after', last.get('effective_params_after', 0))),
             'effective_params_before': int(first.get('effective_params_before', first.get('capacity_params_before', 0))),
             'effective_params_after': int(last.get('effective_params_after', last.get('capacity_params_after', 0))),
-            'pruned_params': int(sum(int(entry.get('pruned_params', 0)) for entry in entries)),
+            'reallocated_params': int(sum(int(entry.get('reallocated_params', 0)) for entry in entries)),
             'components': entries,
             'component_count': int(len(entries)),
-            'whole_model_pruned_params': int(sum(int(entry.get('pruned_params', 0)) for entry in whole_model_entries)),
-            'adapter_pruned_params': int(sum(int(entry.get('pruned_params', 0)) for entry in adapter_entries)),
+            'whole_model_reallocated_params': int(sum(int(entry.get('reallocated_params', 0)) for entry in whole_model_entries)),
+            'adapter_reallocated_params': int(sum(int(entry.get('reallocated_params', 0)) for entry in adapter_entries)),
             'removed_adapters': int(sum(int(entry.get('removed_adapters', 0)) for entry in adapter_entries)),
             'whole_model_amount': float(whole_model_entries[-1].get('amount', 0.0)) if whole_model_entries else 0.0,
             'adapter_amount': float(adapter_entries[-1].get('amount', 0.0)) if adapter_entries else 0.0,
@@ -1982,37 +1933,35 @@ class ContinualLearner:
 
         return combined
 
-    def _auto_prune_network_end_of_task(
+    def _auto_parameter_reallocation_end_of_task(
         self,
         task_id: int,
         train_loader: Optional[DataLoader] = None
     ) -> bool:
-        """Apply network pruning after replay-buffer distillation at each task boundary."""
-        if not self.pruning_enabled:
+        """Apply parameter reallocation after replay-buffer distillation at each task boundary."""
+        if not self.reallocation_enabled:
             return False
 
-        if task_id < self.pruning_warmup_tasks:
+        if task_id < self.reallocation_warmup_tasks:
             print(
-                f"Skipping pruning at task {self._task_label(task_id)}: warmup active "
-                f"(warmup_tasks={self.pruning_warmup_tasks})"
+                f"Skipping reallocation at task {self._task_label(task_id)}: warmup active "
+                f"(warmup_tasks={self.reallocation_warmup_tasks})"
             )
             return False
 
-        if self.pruning_scope == 'hybrid':
-            print(f"\n--- Executing HYBRID pruning at task {self._task_label(task_id)} ---")
+        if self.reallocation_scope == 'hybrid':
+            print(f"\n--- Executing HYBRID reallocation at task {self._task_label(task_id)} ---")
 
-            original_scope = self.pruning_scope
-            original_method = self.pruning_method
-            original_amount = self.pruning_amount
-            history_start = len(self.pruning_history)
+            original_scope = self.reallocation_scope
+            original_amount = self.reallocation_amount
+            history_start = len(self.reallocation_history)
 
             whole_model_success = False
             adapter_success = False
             try:
-                self.pruning_scope = 'whole_model'
-                self.pruning_method = 'structural'
-                self.pruning_amount = self.hybrid_whole_model_amount
-                whole_model_success = self._auto_structural_prune_whole_model(
+                self.reallocation_scope = 'whole_model'
+                self.reallocation_amount = self.hybrid_whole_model_amount
+                whole_model_success = self._auto_structural_reallocation_whole_model(
                     task_id=task_id,
                     train_loader=train_loader
                 )
@@ -2020,146 +1969,67 @@ class ContinualLearner:
                 expected_num_classes = int(self.config.get('benchmark', {}).get('total_classes', 7))
                 self._ensure_classifier_head(expected_num_classes)
 
-                self.pruning_scope = self.hybrid_adapter_scope
-                self.pruning_method = original_method
-                self.pruning_amount = self.hybrid_adapter_amount
-                adapter_success = self._auto_prune_network_end_of_task(
+                self.reallocation_scope = self.hybrid_adapter_scope
+                self.reallocation_amount = self.hybrid_adapter_amount
+                adapter_success = self._auto_parameter_reallocation_end_of_task(
                     task_id=task_id,
                     train_loader=train_loader
                 )
             finally:
-                self.pruning_scope = original_scope
-                self.pruning_method = original_method
-                self.pruning_amount = original_amount
+                self.reallocation_scope = original_scope
+                self.reallocation_amount = original_amount
 
-            new_entries = self.pruning_history[history_start:]
+            new_entries = self.reallocation_history[history_start:]
             if new_entries:
-                combined_entry = self._combine_hybrid_pruning_entries(task_id, new_entries)
-                del self.pruning_history[history_start:]
-                self.pruning_history.append(combined_entry)
+                combined_entry = self._combine_hybrid_reallocation_entries(task_id, new_entries)
+                del self.reallocation_history[history_start:]
+                self.reallocation_history.append(combined_entry)
 
             return bool(whole_model_success or adapter_success)
 
-        if self.pruning_scope == 'whole_model' and self.pruning_method == 'structural':
-            return self._auto_structural_prune_whole_model(
+        if self.reallocation_scope == 'whole_model':
+            return self._auto_structural_reallocation_whole_model(
                 task_id=task_id,
                 train_loader=train_loader
             )
 
-        if self.pruning_scope == 'whole_model':
-            modules_to_prune = self._collect_prunable_dense_parameters()
-            if not modules_to_prune:
-                print(
-                    f"No eligible whole-model parameters found at task {self._task_label(task_id)} "
-                    "(current-task adapters are protected)."
-                )
-                return False
-
-            prunable_effective = self._count_prunable_dense_effective_params(modules_to_prune)
-            if prunable_effective <= 0:
-                print(f"No active dense parameters available to prune at task {self._task_label(task_id)}")
-                return False
-
-            prune_amount = self._resolve_prune_amount(
-                prunable_effective_params=prunable_effective,
-                task_id=task_id
-            )
-            if prune_amount <= 0.0:
-                return False
-
-            before_effective = self._get_effective_model_params()
-            preexisting_reparam = set()
-            try:
-                self._prepare_modules_for_unstructured_pruning(modules_to_prune)
-                preexisting_reparam = {
-                    (id(module), param_name)
-                    for module, param_name in modules_to_prune
-                    if hasattr(module, f"{param_name}_orig")
-                }
-
-                torch_prune.global_unstructured(
-                    modules_to_prune,
-                    pruning_method=torch_prune.L1Unstructured,
-                    amount=prune_amount
-                )
-
-                # Keep pruning masks so zeroed entries remain inactive across tasks.
-                masked_modules = sum(
-                    1 for module, param_name in modules_to_prune
-                    if hasattr(module, f"{param_name}_orig")
-                )
-
-                after_effective = self._get_effective_model_params()
-                capacity_before = int(before_effective)
-                capacity_after = int(after_effective)
-                pruned_now = max(0, capacity_before - capacity_after)
-
-                self.pruning_history.append({
-                    'task_id': int(task_id),
-                    'scope': self.pruning_scope,
-                    'method': 'unstructured',
-                    'amount': float(prune_amount),
-                    'capacity_params_before': int(capacity_before),
-                    'capacity_params_after': int(capacity_after),
-                    'effective_params_before': int(before_effective),
-                    'effective_params_after': int(after_effective),
-                    'pruned_params': int(pruned_now),
-                    'pruned_modules': int(len(modules_to_prune)),
-                    'masked_modules': int(masked_modules)
-                })
-
-                print(
-                    f"Auto-pruned whole model at end of task {self._task_label(task_id)}: "
-                    f"amount={prune_amount:.4f}, modules={len(modules_to_prune)}, "
-                    f"capacity params {capacity_before:,} -> {capacity_after:,} "
-                    f"(freed {pruned_now:,})"
-                )
-                return True
-            except Exception as e:
-                self._remove_pruning_reparam_if_present(
-                    modules_to_prune,
-                    keep_existing_reparam=preexisting_reparam
-                )
-                print(f"[WARNING] Whole-model pruning failed after task {self._task_label(task_id)}: {e}")
-                return False
-
-        if self.pruning_scope not in {'older_adapters_only', 'all_adapters'}:
+        if self.reallocation_scope not in {'older_adapters_only', 'all_adapters'}:
             print(
-                f"[WARNING] Unsupported pruning scope '{self.pruning_scope}'. "
+                f"[WARNING] Unsupported reallocation scope '{self.reallocation_scope}'. "
                 "Falling back to 'whole_model'."
             )
-            self.pruning_scope = 'whole_model'
-            return self._auto_prune_network_end_of_task(task_id, train_loader=train_loader)
+            self.reallocation_scope = 'whole_model'
+            return self._auto_parameter_reallocation_end_of_task(task_id, train_loader=train_loader)
 
         adapter_grad_state = []
         try:
-            if self.pruning_importance == 'taylor' and self.pruning_scope in {'older_adapters_only', 'all_adapters'}:
+            if self.reallocation_importance == 'taylor' and self.reallocation_scope in {'older_adapters_only', 'all_adapters'}:
                 print("Populating Replay gradients to evaluate Adapter AMCA utility...")
 
-                # Adapter pruning happens after training where historical adapters are
+                # Adapter reallocation happens after training where historical adapters are
                 # often frozen. Temporarily enable grads so Taylor can score them.
                 for _, _, adapter in self._iter_adapters():
                     is_new_adapter = id(adapter) in self.current_task_new_adapter_ids
                     if is_new_adapter and (
                         PROTECT_CURRENT_TASK_ADAPTERS
-                        or self.pruning_scope == 'older_adapters_only'
+                        or self.reallocation_scope == 'older_adapters_only'
                     ):
                         continue
                     for p in adapter.parameters():
                         adapter_grad_state.append((p, bool(p.requires_grad)))
                         p.requires_grad = True
 
-                taylor_ready = self._prepare_taylor_gradients_for_pruning(train_loader=train_loader)
+                taylor_ready = self._prepare_taylor_gradients_for_reallocation(train_loader=train_loader)
                 if not taylor_ready:
                     print(
-                        "[WARNING] Could not prepare Taylor gradients for adapter pruning; "
+                        "[WARNING] Could not prepare Taylor gradients for adapter reallocation; "
                         "falling back to magnitude scoring."
                     )
 
-            candidates = self._collect_prunable_adapter_candidates()
+            candidates = self._collect_reallocatable_adapter_candidates()
             if not candidates:
                 print(
-                    f"No removable adapters found for scope '{self.pruning_scope}' at task {self._task_label(task_id)} "
+                    f"No removable adapters found for scope '{self.reallocation_scope}' at task {self._task_label(task_id)} "
                     "(current-task adapters are protected)."
                 )
                 return False
@@ -2170,28 +2040,28 @@ class ContinualLearner:
                 print(f"No removable adapter parameters available at task {self._task_label(task_id)}")
                 return False
 
-            prune_amount = self._resolve_prune_amount(
-                prunable_effective_params=total_candidate_params,
+            reallocation_amount = self._resolve_reallocation_amount(
+                reallocatable_effective_params=total_candidate_params,
                 task_id=task_id
             )
-            if prune_amount <= 0.0:
+            if reallocation_amount <= 0.0:
                 return False
 
-            target_prune_params = int(total_candidate_params * prune_amount)
-            if prune_amount > 0.0:
-                target_prune_params = max(1, target_prune_params)
+            target_reallocation_params = int(total_candidate_params * reallocation_amount)
+            if reallocation_amount > 0.0:
+                target_reallocation_params = max(1, target_reallocation_params)
 
             candidates_sorted = sorted(candidates, key=lambda c: c['score'])
             selected = []
             removed_param_budget = 0
             for candidate in candidates_sorted:
-                if removed_param_budget >= target_prune_params:
+                if removed_param_budget >= target_reallocation_params:
                     break
                 selected.append(candidate)
                 removed_param_budget += int(candidate['adapter_params'])
 
             if not selected:
-                print(f"No adapters selected for pruning at task {self._task_label(task_id)}")
+                print(f"No adapters selected for reallocation at task {self._task_label(task_id)}")
                 return False
 
             try:
@@ -2226,39 +2096,39 @@ class ContinualLearner:
                 after_effective = self._get_effective_model_params()
                 capacity_before = int(before_effective)
                 capacity_after = int(after_effective)
-                pruned_now = max(0, capacity_before - capacity_after)
+                reallocated_now = max(0, capacity_before - capacity_after)
 
                 # Keep tracking set aligned after structural deletions.
                 alive_adapter_ids = {id(adapter) for _, _, adapter in self._iter_adapters()}
                 self.current_task_new_adapter_ids &= alive_adapter_ids
 
-                self.pruning_history.append({
+                self.reallocation_history.append({
                     'task_id': int(task_id),
-                    'scope': self.pruning_scope,
+                    'scope': self.reallocation_scope,
                     'method': 'adapter_delete',
-                    'amount': float(prune_amount),
-                    'importance': ('taylor' if self.pruning_importance == 'taylor' else 'magnitude'),
+                    'amount': float(reallocation_amount),
+                    'importance': ('taylor' if self.reallocation_importance == 'taylor' else 'magnitude'),
                     'capacity_params_before': int(capacity_before),
                     'capacity_params_after': int(capacity_after),
                     'effective_params_before': int(before_effective),
                     'effective_params_after': int(after_effective),
-                    'pruned_params': int(pruned_now),
+                    'reallocated_params': int(reallocated_now),
                     'removed_params': int(removed_params),
                     'removed_adapters': int(removed_adapters),
                     'candidate_params': int(total_candidate_params),
-                    'target_prune_params': int(target_prune_params)
+                    'target_reallocation_params': int(target_reallocation_params)
                 })
 
                 print(
-                    f"Auto-pruned at end of task {self._task_label(task_id)}: "
-                    f"scope={self.pruning_scope}, amount={prune_amount:.4f}, "
+                    f"Auto-reallocated at end of task {self._task_label(task_id)}: "
+                    f"scope={self.reallocation_scope}, amount={reallocation_amount:.4f}, "
                     f"capacity params {capacity_before:,} -> {capacity_after:,} "
-                    f"(freed {pruned_now:,}, removed_adapters={removed_adapters}, "
+                    f"(freed {reallocated_now:,}, removed_adapters={removed_adapters}, "
                     f"removed_params={removed_params:,})"
                 )
                 return True
             except Exception as e:
-                print(f"[WARNING] Auto network pruning failed after task {self._task_label(task_id)}: {e}")
+                print(f"[WARNING] Auto parameter reallocation failed after task {self._task_label(task_id)}: {e}")
                 return False
         finally:
             for param, original_requires_grad in adapter_grad_state:
@@ -2446,7 +2316,7 @@ class ContinualLearner:
             'config': self.config,
             'task_expansions': self.task_expansions,
             'expansion_history': self.expansion_history,
-            'pruning_history': self.pruning_history
+            'reallocation_history': self.reallocation_history
         }, tmp_path)
         os.replace(tmp_path, path)
 
@@ -2456,7 +2326,7 @@ class ContinualLearner:
         self.metrics = checkpoint['metrics']
         self.task_expansions = checkpoint.get('task_expansions', {})
         self.expansion_history = checkpoint.get('expansion_history', [])
-        self.pruning_history = checkpoint.get('pruning_history', [])
+        self.reallocation_history = checkpoint.get('reallocation_history', [])
 
 
 def create_trainer(config: Dict, model, replay_buffer, device='cuda', use_amca=False):

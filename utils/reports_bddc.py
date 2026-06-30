@@ -6,7 +6,7 @@ from datetime import datetime
 from utils.constants import BDDC_INPUT_SIZE
 from utils.report_common import (
     write_amca_summary,
-    write_common_replay_data_pruning_sections,
+    write_common_replay_data_reallocation_sections,
     write_expansion_history,
     write_final_performance,
     write_group_amca_summary,
@@ -14,18 +14,17 @@ from utils.report_common import (
     write_model_stats,
     write_per_class_history,
     write_per_task_overall_history,
-    write_pruning_history,
+    write_reallocation_history,
 )
 
 
-def write_bddc_results(config: dict, trainer, efficiency_metrics, timestamp: str) -> str:
+def write_bddc_results(config: dict, trainer, timestamp: str) -> str:
     """Write a BDD-C result report and return the report path."""
     num_tasks = config['benchmark']['num_tasks']
     class_names = list(config['benchmark']['class_names'])
     metric_groups = dict(config['benchmark'].get('metric_groups', {}))
-    pruning_cfg = config.get('network_pruning', {})
+    reallocation_cfg = config.get('parameter_reallocation', {})
     expansion_cfg = config.get('network_expansion', {})
-    validation_cfg = pruning_cfg.get('validation', {})
     model_cfg = config.get('model', {})
     expansion_strategy = str(expansion_cfg.get('strategy', 'all_layers')).strip().lower()
     total_time = sum(trainer.metrics.task_times.values())
@@ -71,7 +70,7 @@ def write_bddc_results(config: dict, trainer, efficiency_metrics, timestamp: str
         f.write(f"  Class Balanced Loss: {config['training'].get('use_class_balanced_loss', True)}\n")
         f.write(f"  Class Balanced Beta: {config['training'].get('cb_beta', 'N/A')}\n\n")
 
-        write_common_replay_data_pruning_sections(f, config, pruning_cfg, expansion_cfg, expansion_strategy, validation_cfg)
+        write_common_replay_data_reallocation_sections(f, config, reallocation_cfg, expansion_cfg, expansion_strategy)
 
         if trainer.use_amca and trainer.amca_tester is not None:
             write_amca_summary(f, trainer, num_tasks)
@@ -79,10 +78,10 @@ def write_bddc_results(config: dict, trainer, efficiency_metrics, timestamp: str
         write_per_task_overall_history(f, trainer, num_tasks)
         write_per_class_history(f, trainer, num_tasks, class_names)
         write_group_sections(f, trainer, num_tasks, class_names, metric_groups)
-        write_model_stats(f, trainer, efficiency_metrics, total_time)
+        write_model_stats(f, trainer, total_time)
 
         write_expansion_history(f, trainer, num_tasks)
-        write_pruning_history(f, trainer, num_tasks)
+        write_reallocation_history(f, trainer, num_tasks)
         write_final_performance(f, trainer, num_tasks, class_names, metric_groups)
         write_group_amca_summary(f, trainer, metric_groups)
         f.write("\n" + "=" * 80 + "\n")
