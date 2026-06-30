@@ -31,16 +31,6 @@ checkpoints/bddc/
 ```
 
 ## Environment Setup
-
-It is suggested to use a clean Python environment from the repository root.
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
 The code is intended for CUDA training. CPU execution is possible through `--device cpu`, but full training will be slow.
 
 Important dependency notes:
@@ -60,15 +50,6 @@ benchmark:
   data_root: "/path/to/CLAD-C"
   clad_repo_root: "/path/to/CLAD"
 ```
-
-The loader calls the official CLAD APIs:
-
-```python
-clad.get_cladc_train(data_root, img_size=64)
-clad.get_cladc_val(data_root, img_size=64)
-```
-
-Images are transformed to the fixed model input size internally. No additional preprocessing script is required in this repository for CLAD-C.
 
 ### BDD-C
 
@@ -143,7 +124,6 @@ Run commands from the repository root.
 ```bash
 python experiments/train_cladc.py \
   --config config/cladc_config.yaml \
-  --device cuda \
 ```
 
 ### BDD-C
@@ -151,7 +131,6 @@ python experiments/train_cladc.py \
 ```bash
 python experiments/train_bddc.py \
   --config config/bddc_config.yaml \
-  --device cuda \
 ```
 
 Each run writes:
@@ -222,11 +201,6 @@ Supported options are:
 - `hybrid`
 
 Whole-model reallocation is structural only.
-
-## Reproducibility Notes
-
-The training scripts set the PyTorch seed through `--seed`, defaulting to `42`.
-
 
 ## Result Files
 
