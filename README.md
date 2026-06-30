@@ -74,6 +74,26 @@ Images are transformed to the fixed model input size internally. No additional p
 
 BDD-C uses cropped object images and JSON manifests generated from BDD100K-style detection annotations.
 
+Recommended source:
+
+- Dataset Ninja BDD100K: Images 100K: https://datasetninja.com/bdd100k
+
+Dataset Ninja provides the full BDD100K 100K image set with annotations and image-level attributes.
+
+The current BDD-C preprocessing script expects BDD100K-style detection JSON files, not cropped images that have already been grouped into classes. After downloading, arrange or convert the downloaded data into this raw input layout:
+
+```text
+<BASE_DATASET_DIR>/
+  images/
+    train/
+    val/
+  labels/
+    train/
+    val/
+```
+
+Each label JSON must contain image-level `attributes.weather` and `attributes.timeofday`, plus object annotations under `frames[0].objects` with `box2d` and `category` fields. If the Dataset Ninja export is in Supervisely format, export or convert it to this BDD100K-style layout before running the split script.
+
 The preprocessing script is:
 
 ```bash
@@ -87,19 +107,7 @@ BASE_DATASET_DIR = "/workspace/data/bdd"
 OUTPUT_BASE_DIR = "/workspace/data/BDD-C"
 ```
 
-The script expects this raw input layout:
-
-```text
-<BASE_DATASET_DIR>/
-  images/
-    train/
-    val/
-  labels/
-    train/
-    val/
-```
-
-It creates:
+The script expects the raw input layout above and creates:
 
 ```text
 <OUTPUT_BASE_DIR>/
