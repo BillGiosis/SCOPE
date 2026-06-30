@@ -1,0 +1,65 @@
+# BDD-C Benchmark Configuration
+benchmark:
+  name: "BDD-C"
+  data_root: "/workspace/data/BDD-C"
+  eval_split: "val"
+  num_tasks: 5
+
+  max_params_ratio: 1.25
+
+model:
+  backbone: "resnet50d"
+  adapt_downsample_blocks: true  # If false, adapters are only added to same-shape stride-1 bottlenecks
+
+training:
+  batch_size: 64
+  epochs_per_task: 10
+  learning_rate: 0.0001
+  optimizer: "adamw"
+  weight_decay: 0.01
+  use_amp: true
+
+  use_class_balanced_loss: true
+  cb_beta: 0.9999
+
+replay_buffer:
+  enabled: true
+  max_size: 5000
+  distillation_temp: 1.5
+  use_soft_targets: true
+  use_distillation_loss: true
+  replay_batch_size: 32
+  replay_interval_batches: 2
+  auto_distill_end_of_task: true
+  end_of_task_distill_compression_ratio: 0.90
+
+data_loading:
+  num_workers: 32
+  pin_memory: true
+  prefetch_factor: 4
+
+network_expansion:
+  enabled: true
+  strategy: "layer2_layer3_split"  # Options: "all_layers" or "layer2_layer3_split"
+
+parameter_reallocation:
+  enabled: true
+  amount: 0.05  # Used only when scope is not "hybrid"; hybrid uses the amounts below.
+  warmup_tasks: 1
+  scope: "hybrid" # Options: "whole_model", "older_adapters_only", "all_adapters", or "hybrid"
+  hybrid:
+    whole_model_amount: 0.01
+    adapter_amount: 0.30
+    adapter_scope: "older_adapters_only"  # "older_adapters_only" or "all_adapters"
+  importance: "taylor"  # Options: "magnitude" or "taylor"
+  use_replay_for_taylor: true
+  taylor_replay_batches: 6
+  taylor_train_batches: 2
+  taylor_replay_batch_size: 32
+  recovery:
+    enabled: true
+    epochs: 2
+    learning_rate_scale: 0.2
+
+logging:
+  save_dir: "./checkpoints/bddc"

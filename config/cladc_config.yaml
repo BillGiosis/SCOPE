@@ -1,0 +1,72 @@
+# CLAD-C Benchmark Configuration
+benchmark:
+  name: "CLAD-C"
+  data_root: "/workspace/data/CLAD-C"  # Path to CLAD-C dataset
+  clad_repo_root: "/workspace/CLAD" # Change this to your CLAD repository root
+  num_tasks: 6  # Official CLAD-C has 6 temporal tasks
+  num_classes_per_task: 7  # CLAD-C has 7 classes total
+  total_classes: 7  # first one is unused
+
+  # CLAD-C challenge rule used by the network expansion parameter budget
+  max_params_ratio: 1.05  # 105% of initial model params
+
+model:
+  backbone: "resnet50d"
+  adapt_downsample_blocks: false  # If false, adapters are only added to same-shape stride-1 bottlenecks
+
+training:
+  batch_size: 10  # 10 as per CLAD-C challenge
+  epochs_per_task: 70
+  learning_rate: 0.0001
+  optimizer: "adamw"
+  weight_decay: 0.01
+  use_amp: true  # Enable automatic mixed precision on CUDA
+
+  # Gradient accumulation
+  use_gradient_accumulation: true  # Enable gradient accumulation
+  accumulation_steps: 4  # Effective batch size = batch_size * accumulation_steps
+
+  # Class-Balanced Loss
+  use_class_balanced_loss: true
+  cb_beta: 0.9999  # Class-balanced loss beta
+
+replay_buffer:
+  enabled: true  # Enable/disable replay buffer
+  max_size: 1000  # CLAD-C challenge limit
+  distillation_temp: 1.5
+  use_soft_targets: true
+  use_distillation_loss: true
+  replay_batch_size: 32
+  auto_distill_end_of_task: true  # Distill automatically at each task boundary
+  end_of_task_distill_compression_ratio: 0.90  # Keep top 90% by entropy importance
+
+data_loading:
+  num_workers: 8  # Parallel data loading
+  pin_memory: true  # Use pinned memory for faster GPU transfers
+  prefetch_factor: 4  # Prefetch batches
+
+network_expansion:
+  enabled: true
+  strategy: "layer2_layer3_split"  # Options: "all_layers" or "layer2_layer3_split"
+
+parameter_reallocation:
+  enabled: true
+  amount: 0.05  # Used only when scope is not "hybrid"; hybrid uses the amounts below.
+  warmup_tasks: 2  # Do not run reallocation during first N tasks to protect early AMCA
+  scope: "hybrid"  # Options: "whole_model", "older_adapters_only", "all_adapters", or "hybrid"
+  hybrid:
+    whole_model_amount: 0.01
+    adapter_amount: 0.40
+    adapter_scope: "older_adapters_only"  # "older_adapters_only" or "all_adapters"
+  importance: "taylor"  # Options: "magnitude" or "taylor"
+  use_replay_for_taylor: true
+  taylor_replay_batches: 6
+  taylor_train_batches: 4
+  taylor_replay_batch_size: 32
+  recovery:
+    enabled: true
+    epochs: 5
+    learning_rate_scale: 0.2
+
+logging:
+  save_dir: "./checkpoints/cladc"
