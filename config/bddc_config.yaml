@@ -31,7 +31,7 @@ replay_buffer:
   replay_batch_size: 32
   replay_interval_batches: 2
   auto_distill_end_of_task: true
-  end_of_task_distill_compression_ratio: 0.75
+  end_of_task_distill_compression_ratio: 0.90
 
 data_loading:
   num_workers: 32

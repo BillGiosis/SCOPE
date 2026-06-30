@@ -55,7 +55,6 @@ def write_cladc_results(config: dict, trainer, timestamp: str) -> str:
         f.write("Model:\n")
         f.write(f"  Backbone: {model_cfg.get('backbone', 'resnet50d')}\n")
         f.write(f"  Adapt Downsample Blocks: {model_cfg.get('adapt_downsample_blocks', True)}\n")
-        f.write(f"  Input Size: {CLADC_INPUT_SIZE}\n\n")
 
         f.write("Training:\n")
         f.write(f"  Batch Size: {config['training']['batch_size']}\n")

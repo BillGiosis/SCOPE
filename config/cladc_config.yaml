@@ -27,7 +27,7 @@ training:
   accumulation_steps: 4  # Effective batch size = batch_size * accumulation_steps
 
   # Class-Balanced Loss
-  use_class_balanced_loss: false
+  use_class_balanced_loss: true
   cb_beta: 0.9999  # Class-balanced loss beta
 
 replay_buffer:

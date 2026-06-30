@@ -57,7 +57,6 @@ def write_bddc_results(config: dict, trainer, timestamp: str) -> str:
         f.write("Model:\n")
         f.write(f"  Backbone: {model_cfg.get('backbone', 'resnet50d')}\n")
         f.write(f"  Adapt Downsample Blocks: {model_cfg.get('adapt_downsample_blocks', True)}\n")
-        f.write(f"  Input Size: {BDDC_INPUT_SIZE}\n\n")
 
         f.write("Training:\n")
         f.write(f"  Batch Size: {config['training']['batch_size']}\n")
@@ -66,7 +65,6 @@ def write_bddc_results(config: dict, trainer, timestamp: str) -> str:
         f.write(f"  Optimizer: {config['training']['optimizer']}\n")
         f.write(f"  Weight Decay: {config['training']['weight_decay']}\n")
         f.write(f"  AMP: {config['training'].get('use_amp', False)}\n")
-        f.write("  Gradient Accumulation: False\n")
         f.write(f"  Class Balanced Loss: {config['training'].get('use_class_balanced_loss', True)}\n")
         f.write(f"  Class Balanced Beta: {config['training'].get('cb_beta', 'N/A')}\n\n")
 
