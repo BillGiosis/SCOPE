@@ -198,38 +198,15 @@ auto_distill_end_of_task: true | false
 
 Controls adapter expansion at the start of each task.
 
-```yaml
-enabled: true
-strategy: "layer2_layer3_split"
-```
 
 The current strategy expands adapters in layer2 and layer3 at task start.
+There is also the option of expanding all layers at task start.
 
 ### `parameter_reallocation`
 
 Controls end-of-task parameter reallocation.
 
-```yaml
-enabled: true
-amount: 0.05
-warmup_tasks: 1
-scope: "hybrid"
-hybrid:
-  whole_model_amount: 0.01
-  adapter_amount: 0.30
-  adapter_scope: "older_adapters_only"
-importance: "taylor"
-use_replay_for_taylor: true
-taylor_replay_batches: 6
-taylor_train_batches: 2
-taylor_replay_batch_size: 32
-recovery:
-  enabled: true
-  epochs: 2
-  learning_rate_scale: 0.2
-```
-
-Supported scopes are:
+Supported options are:
 
 - `whole_model`
 - `older_adapters_only`
