@@ -63,3 +63,7 @@ parameter_reallocation:
 
 logging:
   save_dir: "./checkpoints/bddc"
+  phase_snapshots: true  # Extra pre/post-pruning evaluations; separate from primary AMCA
+  save_phase_models: true  # Requires phase_snapshots; large optional CPU model artifacts
+  profile_cuda: true  # Synchronize phase boundaries and measure peak allocated/reserved GPU bytes
+  save_inference_model: true  # Optional final architecture+weights for standalone profiling/Grad-CAM

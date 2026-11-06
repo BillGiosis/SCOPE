@@ -3,10 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import copy
+from contextlib import contextmanager
 from torch.utils.data import DataLoader, ConcatDataset
 from typing import Dict, List, Optional
 import time
 import os
+import math
 
 try:
     import torch_pruning as tp
@@ -18,11 +20,12 @@ from buffers.replay_buffer import ReplayBuffer
 from utils.metrics import (
     MetricsTracker,
     AMCATester,
-    evaluate_model,
     evaluate_model_with_groups,
     compute_model_size
 )
 from utils.losses import ClassBalancedLoss
+from utils.observations import RunObservations, observation_context, process_memory_stats
+from utils.pruning_observations import SafeStructuralImportance, prune_with_records
 from trainers.reallocation_policy import (
     PROTECT_CLASSIFIER,
     PROTECT_CURRENT_TASK_ADAPTERS,
@@ -93,6 +96,11 @@ class ContinualLearner:
         self.learning_rate = config['training']['learning_rate']
         self.optimizer_name = config['training']['optimizer']
         self.weight_decay = config['training']['weight_decay']
+        self.historical_adapter_policy = str(
+            config['training'].get('historical_adapter_policy', 'frozen')
+        ).strip().lower()
+        if self.historical_adapter_policy not in {'frozen', 'joint'}:
+            raise ValueError('historical_adapter_policy must be frozen or joint')
 
         expansion_cfg = config.get('network_expansion', {})
         self.expansion_enabled = expansion_cfg.get('enabled', True)
@@ -174,6 +182,9 @@ class ContinualLearner:
         self.expansion_history = []
         self.reallocation_history = []
         self.current_task_new_adapter_ids = set()
+        self._next_adapter_uid = 0
+        self._active_task_id = None
+        self.observations = RunObservations(config, device)
         self.last_taylor_gradient_stats = {
             'replay_batches': 0,
             'train_batches': 0,
@@ -358,7 +369,8 @@ class ContinualLearner:
     def _expand_network_at_task_start(self, task_id: int):
         """Apply deterministic network expansion once at the start of each task."""
         executed = []
-        before_adapter_ids = {id(adapter) for _, _, adapter in self._iter_adapters()}
+        self._active_task_id = int(task_id)
+        before_adapter_ids = {self._adapter_uid(adapter) for _, _, adapter in self._iter_adapters()}
         self.current_task_new_adapter_ids = set()
 
         if not self.expansion_enabled:
@@ -383,8 +395,11 @@ class ContinualLearner:
         for layer_name in executed:
             self.expansion_history.append((task_id, f"expand_{layer_name}"))
 
-        after_adapter_ids = {id(adapter) for _, _, adapter in self._iter_adapters()}
+        after_adapter_ids = {self._adapter_uid(adapter) for _, _, adapter in self._iter_adapters()}
         self.current_task_new_adapter_ids = after_adapter_ids - before_adapter_ids
+        for _, _, adapter in self._iter_adapters():
+            if self._adapter_uid(adapter) in self.current_task_new_adapter_ids:
+                adapter.scope_birth_task = int(task_id)
 
         if executed:
             print(f"Expanded at task start: {executed}")
@@ -404,11 +419,62 @@ class ContinualLearner:
                 for adapter in adapters:
                     yield layer_name, block_idx, adapter
 
+    def _adapter_uid(self, adapter):
+        """An identity that survives deepcopy and parameter replacement."""
+        if not hasattr(adapter, 'scope_uid'):
+            adapter.scope_uid = self._next_adapter_uid
+            self._next_adapter_uid += 1
+        self._next_adapter_uid = max(self._next_adapter_uid, int(adapter.scope_uid) + 1)
+        return adapter.scope_uid
+
+    def _is_current_adapter(self, adapter):
+        return self._adapter_uid(adapter) in self.current_task_new_adapter_ids
+
+    def _restore_trainability(self, flags):
+        for name, parameter in self.model.named_parameters():
+            if name in flags:
+                parameter.requires_grad_(flags[name])
+        self.current_task_new_adapter_ids.intersection_update(
+            self._adapter_uid(adapter) for _, _, adapter in self._iter_adapters())
+        self._apply_adapter_training_modes()
+
     def _apply_adapter_training_modes(self):
-        """Keep frozen historical adapters, including their BN buffers, fixed."""
+        """Match adapter module modes to the selected training policy."""
         for _, _, adapter in self._iter_adapters():
-            is_new_adapter = id(adapter) in self.current_task_new_adapter_ids
-            adapter.train(bool(is_new_adapter))
+            is_new_adapter = self._is_current_adapter(adapter)
+            adapter.train(bool(is_new_adapter or self.historical_adapter_policy == 'joint'))
+
+    def _apply_adapter_trainability(self):
+        """Set the task's optimizer eligibility, including the optional joint control."""
+        counts = {'trainable_new': 0, 'trainable_historical': 0, 'frozen_historical': 0}
+        for _, _, adapter in self._iter_adapters():
+            is_new_adapter = self._is_current_adapter(adapter)
+            trainable = bool(is_new_adapter or self.historical_adapter_policy == 'joint')
+            for parameter in adapter.parameters():
+                parameter.requires_grad = trainable
+            key = ('trainable_new' if is_new_adapter else
+                   'trainable_historical' if trainable else 'frozen_historical')
+            counts[key] += 1
+        self._apply_adapter_training_modes()
+        return counts
+
+    @contextmanager
+    def _reference_structural_adapter_trainability(self):
+        """Hold structural scoring eligibility fixed for the joint-training control.
+
+        Torch-Pruning can replace Parameters or restore a copied model. Restore
+        flags by name so historical adapters remain trainable during recovery.
+        Whole-adapter deletion keeps its existing temporary gradient policy.
+        """
+        flags = {name: bool(p.requires_grad) for name, p in self.model.named_parameters()}
+        try:
+            for _, _, adapter in self._iter_adapters():
+                if not self._is_current_adapter(adapter):
+                    for parameter in adapter.parameters():
+                        parameter.requires_grad_(False)
+            yield
+        finally:
+            self._restore_trainability(flags)
 
     def _get_reallocation_example_input(self, train_loader: Optional[DataLoader] = None) -> Optional[torch.Tensor]:
         """Build example input for graph-based structural reallocation."""
@@ -446,7 +512,7 @@ class ContinualLearner:
             return None
 
     def _collect_structural_reallocation_ignored_layers(self) -> List[nn.Module]:
-        """Collect strict protection list for structural reallocation."""
+        """Protect output-pruning roots; dependent input dimensions may still change."""
         ignored_layers = []
         ignored_ids = set()
 
@@ -471,7 +537,7 @@ class ContinualLearner:
 
         if PROTECT_CURRENT_TASK_ADAPTERS:
             for _, _, adapter in self._iter_adapters():
-                if id(adapter) not in self.current_task_new_adapter_ids:
+                if not self._is_current_adapter(adapter):
                     continue
                 for m in adapter.modules():
                     if not isinstance(m, (nn.Conv2d, nn.Linear, nn.BatchNorm2d, nn.BatchNorm1d)):
@@ -533,6 +599,9 @@ class ContinualLearner:
 
         replay_batches_used = 0
         train_batches_used = 0
+        replay_samples_used = 0
+        train_samples_used = 0
+        replay_kd_batches = 0
         use_distillation_loss = bool(
             self.config.get('replay_buffer', {}).get('use_distillation_loss', True)
         )
@@ -597,9 +666,11 @@ class ContinualLearner:
                             soft_targets,
                             reduction='batchmean'
                         )
+                        replay_kd_batches += 1
 
                 replay_loss.backward()
                 replay_batches_used += 1
+                replay_samples_used += int(replay_labels.numel())
 
         if train_loader is not None and self.reallocation_taylor_train_batches > 0:
             for batch_idx, (images, labels) in enumerate(train_loader):
@@ -636,6 +707,7 @@ class ContinualLearner:
                 loss = F.cross_entropy(logits.float(), labels)
                 loss.backward()
                 train_batches_used += 1
+                train_samples_used += int(labels.numel())
 
                 if train_batches_used >= self.reallocation_taylor_train_batches:
                     break
@@ -644,7 +716,12 @@ class ContinualLearner:
         self.last_taylor_gradient_stats = {
             'replay_batches': int(replay_batches_used),
             'train_batches': int(train_batches_used),
-            'total_batches': int(total_batches)
+            'total_batches': int(total_batches),
+            'replay_samples': replay_samples_used, 'train_samples': train_samples_used,
+            'replay_kd_batches': replay_kd_batches,
+            'loss': 'current: plain CE; replay: plain CE + 0.5*T^2*KL when targets/KD enabled',
+            'gradient_aggregation': 'equal mean of batch-mean gradients; score after averaging',
+            'precision': 'FP32', 'mode': 'eval',
         }
 
         if total_batches <= 0:
@@ -652,6 +729,8 @@ class ContinualLearner:
             return False
 
         scale = 1.0 / float(total_batches)
+        zero_filled = 0
+        frozen_zero_filled = 0
         for parameter in self.model.parameters():
             if parameter.grad is not None:
                 parameter.grad.mul_(scale)
@@ -659,6 +738,11 @@ class ContinualLearner:
                 # Ensure every parameter has a gradient tensor so Taylor-based
                 # importance never receives None gradients from the structural dependency.
                 parameter.grad = torch.zeros_like(parameter)
+                zero_filled += 1
+                frozen_zero_filled += int(not parameter.requires_grad)
+        self.last_taylor_gradient_stats.update(
+            zero_filled_gradient_tensors=zero_filled,
+            frozen_zero_filled_gradient_tensors=frozen_zero_filled)
 
         print(
             "Prepared Taylor gradients for structural reallocation: "
@@ -674,6 +758,7 @@ class ContinualLearner:
         """Resolve structural reallocation importance criterion from config."""
         if tp is None:
             raise RuntimeError("The structural reallocation dependency is required for importance resolution")
+        self.last_importance_fallback_reason = None
 
         if self.reallocation_importance != 'taylor':
             self.last_taylor_gradient_stats = {
@@ -685,6 +770,7 @@ class ContinualLearner:
 
         taylor_ready = self._prepare_taylor_gradients_for_reallocation(train_loader=train_loader)
         if not taylor_ready:
+            self.last_importance_fallback_reason = 'no_valid_taylor_gradients'
             print(
                 "[WARNING] Taylor importance requested but no gradients were prepared. "
                 "Falling back to magnitude importance."
@@ -696,6 +782,7 @@ class ContinualLearner:
             taylor_cls = getattr(tp.importance, 'TaylorImportance', None)
 
         if taylor_cls is None:
+            self.last_importance_fallback_reason = 'taylor_class_unavailable'
             print(
                 "[WARNING] Structural reallocation Taylor importance class not found. "
                 "Falling back to magnitude importance."
@@ -705,6 +792,7 @@ class ContinualLearner:
         try:
             return taylor_cls(), 'taylor'
         except Exception as e:
+            self.last_importance_fallback_reason = f'taylor_initialization_failed: {e}'
             print(
                 "[WARNING] Could not initialize Taylor importance "
                 f"({e}); falling back to magnitude importance."
@@ -761,13 +849,19 @@ class ContinualLearner:
         try:
             current_params = self._get_effective_model_params()
             projected_delta = self._estimate_expand_layer_params_delta(layer_name)
+            event = {'task_id': self._active_task_id, 'event': 'expansion', 'layer': layer_name,
+                     'params_before': int(current_params), 'projected_delta': int(projected_delta),
+                     'cap': int(self.max_params), 'accepted': False}
+            self.observations.events.append(event)
 
             if projected_delta <= 0:
+                event['reason'] = 'no_eligible_blocks'
                 print(f"No eligible blocks to expand in {layer_name}.")
                 return False
 
             projected_params = current_params + projected_delta
             if projected_params > self.max_params:
+                event['reason'] = 'parameter_cap'
                 print(
                     f"Skipping {layer_name} expansion: projected params "
                     f"{projected_params:,} would exceed limit {self.max_params:,}."
@@ -783,8 +877,11 @@ class ContinualLearner:
             )
 
             if after_trainable <= before_trainable:
+                event['reason'] = 'no_parameters_added'
                 print(f"Expansion request for {layer_name} did not add trainable parameters.")
                 return False
+            event.update(accepted=True, params_after=int(self._get_effective_model_params()),
+                         actual_delta=int(self._get_effective_model_params() - current_params))
             return True
         except Exception as e:
             print(f"Error expanding {layer_name}: {e}")
@@ -902,29 +999,33 @@ class ContinualLearner:
         self._ensure_classifier_head(expected_num_classes)
 
         # Deterministic expansion is applied exactly once per task, before optimizer creation.
-        self._expand_network_at_task_start(task_id)
+        self._active_task_id = int(task_id)
+        self._record_resource_event(task_id, 'before_expansion')
+        with self.observations.phase(task_id, 'expansion'):
+            self._expand_network_at_task_start(task_id)
+        self._record_resource_event(task_id, 'after_expansion')
 
-        frozen_historical_adapters = 0
-        trainable_new_adapters = 0
-        for _, _, adapter in self._iter_adapters():
-            is_new_adapter = id(adapter) in self.current_task_new_adapter_ids
-            for param in adapter.parameters():
-                param.requires_grad = bool(is_new_adapter)
-            if is_new_adapter:
-                trainable_new_adapters += 1
-            else:
-                frozen_historical_adapters += 1
-
+        adapter_counts = self._apply_adapter_trainability()
         print(
-            "Adapter freeze policy applied: "
-            f"trainable_new={trainable_new_adapters}, "
-            f"frozen_historical={frozen_historical_adapters}"
+            f"Adapter training policy={self.historical_adapter_policy}: "
+            + ', '.join(f'{key}={value}' for key, value in adapter_counts.items())
         )
-        self._apply_adapter_training_modes()
+        self.observations.events.append({
+            'task_id': int(task_id), 'event': 'adapter_training_policy',
+            'policy': self.historical_adapter_policy, **adapter_counts,
+        })
 
-        self._prepare_training_model_for_task(task_id)
+        with self.observations.phase(task_id, 'compile_setup'):
+            self._prepare_training_model_for_task(task_id)
         
         self._create_optimizer()
+        self.observations.events.append({
+            'task_id': int(task_id), 'event': 'training_backend',
+            'compiled': self.train_model is not self.model, 'amp': bool(self.use_amp),
+            'optimizer': type(self.optimizer).__name__,
+            'optimizer_fused': self.optimizer.defaults.get('fused'),
+            'training_loss': 'current CB/CE + 0.5*replay CE + 0.3*T^2*KL when KD enabled',
+        })
         
         training_cfg = self.config.get('training', {})
         use_class_balanced_loss = bool(training_cfg.get('use_class_balanced_loss', True))
@@ -987,9 +1088,11 @@ class ContinualLearner:
             self.criterion = None
             
         all_test_datasets = []
+        evaluated_task_ids = []
         for tid in range(task_id + 1):
             if tid < len(test_loaders) and test_loaders[tid] is not None:
                 all_test_datasets.append(test_loaders[tid].dataset)
+                evaluated_task_ids.append(tid)
         
         cached_test_loader = None
         cached_group_ids = {}
@@ -1025,6 +1128,13 @@ class ContinualLearner:
                         group_names=group_names
                     )
                 cached_group_ids[group_name] = self._cached_group_ids[cache_key][group_name]
+            # Recover per-task counts from the existing concatenated evaluation.
+            # CLAD's single common validation set has no task partition.
+            if len(test_loaders) > 1:
+                cached_group_ids['__eval_task__'] = torch.cat([
+                    torch.full((len(dataset),), tid, dtype=torch.long)
+                    for tid, dataset in zip(evaluated_task_ids, all_test_datasets)
+                ])
 
         replay_candidates = {'images': [], 'labels': [], 'logits': []}
         last_eval_snapshot = None
@@ -1043,13 +1153,10 @@ class ContinualLearner:
                 is_last_epoch = (epoch == self.epochs_per_task - 1)
                 collection_dict = replay_candidates if is_last_epoch else None
 
-                epoch_loss, epoch_acc = self._train_epoch(
-                    task_id,
-                    train_loader,
-                    epoch,
-                    collection_dict,
-                    task_progress_bar=task_progress_bar,
-                )
+                with self.observations.phase(task_id, 'main_training'):
+                    epoch_loss, epoch_acc = self._train_epoch(
+                        task_id, train_loader, epoch, collection_dict,
+                        task_progress_bar=task_progress_bar)
                 task_progress_bar.set_postfix(
                     {
                         'loss': f'{epoch_loss:.4f}',
@@ -1075,15 +1182,29 @@ class ContinualLearner:
             
         replay_enabled = self.config.get('replay_buffer', {}).get('enabled', True)
         if replay_enabled:
-            if len(replay_candidates['images']) > 0:
-                self._update_replay_buffer_from_memory(task_id, replay_candidates)
-            else:
-                self._update_replay_buffer(task_id, train_loader)
+            with self.observations.phase(task_id, 'replay_update'):
+                if len(replay_candidates['images']) > 0:
+                    self._update_replay_buffer_from_memory(task_id, replay_candidates)
+                else:
+                    self._update_replay_buffer(task_id, train_loader)
 
-        self._auto_distill_replay_buffer_end_of_task(task_id)
+        self._record_resource_event(task_id, 'before_compaction')
+        with self.observations.phase(task_id, 'buffer_compaction'):
+            self._auto_distill_replay_buffer_end_of_task(task_id)
+        self._record_resource_event(task_id, 'after_compaction')
 
-        reallocation_applied = self._auto_parameter_reallocation_end_of_task(task_id, train_loader=train_loader)
-        self._post_reallocation_recovery(task_id, train_loader, reallocation_applied)
+        observe_cycle = self.observations.phase_snapshots and self._is_reallocation_task(task_id)
+        if observe_cycle:
+            self._capture_phase_snapshot(task_id, 'pre_pruning', cached_test_loader, cached_group_ids)
+        with self.observations.phase(task_id, 'reallocation_total'):
+            reallocation_applied = self._auto_parameter_reallocation_end_of_task(task_id, train_loader=train_loader)
+        self._record_resource_event(task_id, 'after_pruning')
+        if observe_cycle:
+            self._capture_phase_snapshot(task_id, 'post_pruning', cached_test_loader, cached_group_ids,
+                                         reallocation_applied=reallocation_applied)
+        with self.observations.phase(task_id, 'recovery_total'):
+            self._post_reallocation_recovery(task_id, train_loader, reallocation_applied)
+        self._record_resource_event(task_id, 'after_recovery')
 
         if not reallocation_applied and last_eval_snapshot is not None:
             print(
@@ -1106,16 +1227,18 @@ class ContinualLearner:
                         f"AMCA: {self.amca_tester.compute_amca():.4f}"
                     )
                 except Exception as e:
-                    print(f"AMCA error: {e}")
-                    self.amca_tester.mean_class_accuracies.append(0.0)
+                    raise RuntimeError('Could not record task-end AMCA') from e
         else:
             print(f"\nFinal evaluation after task {self._task_label(task_id)}:")
-            self._evaluate_and_update_metrics(
+            last_eval_snapshot = self._evaluate_and_update_metrics(
                 task_id,
                 cached_test_loader,
                 group_id_tensors=cached_group_ids,
                 run_amca=True
             )
+        if observe_cycle:
+            self._capture_phase_snapshot(task_id, 'post_recovery', cached_test_loader, cached_group_ids,
+                                         results=last_eval_snapshot, reallocation_applied=reallocation_applied)
 
         task_elapsed_time = time.time() - task_start_time
         self.metrics.record_task_time(task_id, task_elapsed_time)
@@ -1132,7 +1255,9 @@ class ContinualLearner:
                 "last-good snapshot not updated."
             )
         else:
-            self._snapshot_last_good_model(task_id)
+            with self.observations.phase(task_id, 'last_good_snapshot'):
+                self._snapshot_last_good_model(task_id)
+        self.observations.flush(self)
     
     def _train_epoch(
         self,
@@ -1610,10 +1735,11 @@ class ContinualLearner:
 
         print("Post-reallocation recovery complete")
 
-    def _collect_reallocatable_adapter_candidates(self) -> List[Dict]:
-        """Collect removable adapter candidates with optional AMCA-aware Taylor scoring."""
+    def _collect_reallocatable_adapter_candidates(self, use_taylor_scoring=None) -> List[Dict]:
+        """Score whole adapters with an unnormalized sum of |w*grad| or |w|."""
         candidates = []
-        use_taylor_scoring = (self.reallocation_importance == 'taylor')
+        if use_taylor_scoring is None:
+            use_taylor_scoring = (self.reallocation_importance == 'taylor')
 
         for layer_name in ["layer1", "layer2", "layer3", "layer4"]:
             if not hasattr(self.model, layer_name):
@@ -1625,7 +1751,7 @@ class ContinualLearner:
                     continue
 
                 for adapter_idx, adapter in enumerate(adapters):
-                    adapter_id = id(adapter)
+                    adapter_id = self._adapter_uid(adapter)
                     is_new_adapter = adapter_id in self.current_task_new_adapter_ids
                     if PROTECT_CURRENT_TASK_ADAPTERS and is_new_adapter:
                         continue
@@ -1645,6 +1771,8 @@ class ContinualLearner:
                             score += float(p.detach().abs().sum().item())
 
                     candidates.append({
+                        'adapter_uid': adapter_id,
+                        'birth_task': getattr(adapter, 'scope_birth_task', None),
                         'layer_name': layer_name,
                         'block_idx': int(block_idx),
                         'adapter_idx': int(adapter_idx),
@@ -1656,15 +1784,15 @@ class ContinualLearner:
 
     def _collect_reallocatable_dense_parameters(self) -> List[tuple]:
         """
-        Collect Conv/Linear weights across the whole model for magnitude reallocation.
+        Collect trainable Conv/Linear weights for the eligibility/counting check.
 
-        Current-task adapters are excluded so freshly introduced task adapters
-        remain untouched at this task boundary.
+        This list does not restrict Torch-Pruning's actual dependency-graph roots.
+        Current adapters are excluded here and protected as roots by ignored_layers.
         """
         protected_module_ids = set()
         if PROTECT_CURRENT_TASK_ADAPTERS:
             for _, _, adapter in self._iter_adapters():
-                if id(adapter) not in self.current_task_new_adapter_ids:
+                if not self._is_current_adapter(adapter):
                     continue
                 for m in adapter.modules():
                     protected_module_ids.add(id(m))
@@ -1726,6 +1854,16 @@ class ContinualLearner:
         task_id: int,
         train_loader: Optional[DataLoader] = None
     ) -> bool:
+        if self.historical_adapter_policy == 'joint':
+            with self._reference_structural_adapter_trainability():
+                return self._auto_structural_reallocation_whole_model_impl(task_id, train_loader)
+        return self._auto_structural_reallocation_whole_model_impl(task_id, train_loader)
+
+    def _auto_structural_reallocation_whole_model_impl(
+        self,
+        task_id: int,
+        train_loader: Optional[DataLoader] = None
+    ) -> bool:
         """Apply physical channel/filter reallocation for whole-model mode."""
         if tp is None:
             print(
@@ -1763,31 +1901,37 @@ class ContinualLearner:
         before_effective = self._get_effective_model_params()
         before_total = int(self.model.get_num_parameters()) if hasattr(self.model, 'get_num_parameters') else int(sum(p.numel() for p in self.model.parameters()))
         pre_reallocation_snapshot = None
+        trainability = {name: bool(p.requires_grad) for name, p in self.model.named_parameters()}
         try:
             pre_reallocation_snapshot = copy.deepcopy(self.model).cpu()
         except Exception as e:
             print(f"[WARNING] Could not snapshot model before structural reallocation at task {self._task_label(task_id)}: {e}")
+            return False
 
         try:
             self.model.eval()
             with torch.no_grad():
                 _ = self.model(example_inputs)
 
-            importance, importance_name = self._resolve_structural_importance(
-                train_loader=train_loader
-            )
+            with self.observations.phase(task_id, 'structural_scoring'):
+                importance, importance_name = self._resolve_structural_importance(train_loader=train_loader)
+            guarded_importance = SafeStructuralImportance(
+                importance, tp.importance.MagnitudeImportance(p=1),
+                {module: name for name, module in self.model.named_modules()})
+            fallback_reason = self.last_importance_fallback_reason
             reallocator = tp.pruner.MagnitudePruner(
                 self.model,
                 example_inputs=example_inputs,
-                importance=importance,
+                importance=guarded_importance,
                 pruning_ratio=float(reallocation_amount),
                 ignored_layers=ignored_layers,
             )
 
             try:
-                reallocator.step()
+                groups = prune_with_records(reallocator, self.model)
             except Exception as reallocation_error:
                 if importance_name == 'taylor':
+                    fallback_reason = f'taylor_step_failed: {reallocation_error}'
                     print(
                         f"[WARNING] Taylor structural reallocation failed at task {self._task_label(task_id)}: {reallocation_error}. "
                         "Retrying once with magnitude importance."
@@ -1801,6 +1945,9 @@ class ContinualLearner:
                         restored = restored.to(memory_format=torch.channels_last)
                     self.model = restored
                     self.train_model = self.model
+                    self._restore_trainability(trainability)
+                    # All protection objects must belong to the restored graph.
+                    ignored_layers = self._collect_structural_reallocation_ignored_layers()
 
                     self.model.eval()
                     with torch.no_grad():
@@ -1814,10 +1961,21 @@ class ContinualLearner:
                         pruning_ratio=float(reallocation_amount),
                         ignored_layers=ignored_layers,
                     )
-                    reallocator.step()
+                    groups = prune_with_records(reallocator, self.model)
                     importance_name = 'magnitude_fallback'
                 else:
                     raise
+
+            self._restore_trainability(trainability)
+            self.model.eval()
+            with torch.no_grad():
+                output = self.model(example_inputs)
+                expected = int(self.config.get('benchmark', {}).get('total_classes', 7))
+                if output.ndim != 2 or output.shape[1] != expected or not bool(torch.isfinite(output).all()):
+                    raise RuntimeError('Post-pruning forward validation failed')
+            if guarded_importance.events and importance_name == 'taylor':
+                if any(event['action'] == 'magnitude_fallback' for event in guarded_importance.events):
+                    importance_name = 'taylor+magnitude_group_fallback'
 
             if self.device == 'cuda':
                 torch.cuda.empty_cache()
@@ -1834,6 +1992,15 @@ class ContinualLearner:
                 'method': 'structural',
                 'amount': float(reallocation_amount),
                 'importance': importance_name,
+                'requested_importance': self.reallocation_importance,
+                'fallback_reason': fallback_reason,
+                'importance_events': guarded_importance.events,
+                'actual_pruned_groups': groups,
+                'ratio_unit': 'per-root channel fraction (local Torch-Pruning policy)',
+                'scalar_parameter_removal_fraction': reallocated_now / max(1, capacity_before),
+                'group_reduction': getattr(importance, 'group_reduction', None),
+                'normalizer': getattr(importance, 'normalizer', None),
+                'taylor_scoring': dict(self.last_taylor_gradient_stats),
                 'capacity_params_before': int(capacity_before),
                 'capacity_params_after': int(capacity_after),
                 'effective_params_before': int(before_effective),
@@ -1865,6 +2032,7 @@ class ContinualLearner:
                         restored = restored.to(memory_format=torch.channels_last)
                     self.model = restored
                     self.train_model = self.model
+                    self._restore_trainability(trainability)
                     print(
                         f"[WARNING] Restored pre-reallocation snapshot after structural reallocation failure "
                         f"at task {self._task_label(task_id)}."
@@ -1875,6 +2043,7 @@ class ContinualLearner:
                         f"{restore_error}"
                     )
             print(f"[WARNING] Structural whole-model reallocation failed after task {self._task_label(task_id)}: {e}")
+            self.observations.events.append({'task_id': task_id, 'event': 'structural_rollback', 'reason': str(e)})
             return False
 
     @staticmethod
@@ -2002,14 +2171,15 @@ class ContinualLearner:
             return self._auto_parameter_reallocation_end_of_task(task_id, train_loader=train_loader)
 
         adapter_grad_state = []
+        taylor_ready = False
         try:
             if self.reallocation_importance == 'taylor' and self.reallocation_scope in {'older_adapters_only', 'all_adapters'}:
-                print("Populating Replay gradients to evaluate Adapter AMCA utility...")
+                print("Preparing Taylor gradients for historical-adapter deletion...")
 
                 # Adapter reallocation happens after training where historical adapters are
                 # often frozen. Temporarily enable grads so Taylor can score them.
                 for _, _, adapter in self._iter_adapters():
-                    is_new_adapter = id(adapter) in self.current_task_new_adapter_ids
+                    is_new_adapter = self._is_current_adapter(adapter)
                     if is_new_adapter and (
                         PROTECT_CURRENT_TASK_ADAPTERS
                         or self.reallocation_scope == 'older_adapters_only'
@@ -2019,14 +2189,23 @@ class ContinualLearner:
                         adapter_grad_state.append((p, bool(p.requires_grad)))
                         p.requires_grad = True
 
-                taylor_ready = self._prepare_taylor_gradients_for_reallocation(train_loader=train_loader)
+                with self.observations.phase(task_id, 'adapter_scoring'):
+                    taylor_ready = self._prepare_taylor_gradients_for_reallocation(train_loader=train_loader)
                 if not taylor_ready:
                     print(
                         "[WARNING] Could not prepare Taylor gradients for adapter reallocation; "
                         "falling back to magnitude scoring."
                     )
 
-            candidates = self._collect_reallocatable_adapter_candidates()
+            candidates = self._collect_reallocatable_adapter_candidates(use_taylor_scoring=taylor_ready)
+            importance_name = 'taylor' if taylor_ready else 'magnitude'
+            fallback_reason = ('no_valid_taylor_gradients' if self.reallocation_importance == 'taylor' and not taylor_ready else None)
+            if any(not math.isfinite(candidate['score']) for candidate in candidates):
+                candidates = self._collect_reallocatable_adapter_candidates(use_taylor_scoring=False)
+                importance_name = 'magnitude_fallback'
+                fallback_reason = 'nonfinite_adapter_scores'
+            if any(not math.isfinite(candidate['score']) for candidate in candidates):
+                raise RuntimeError('Non-finite adapter scores including magnitude fallback')
             if not candidates:
                 print(
                     f"No removable adapters found for scope '{self.reallocation_scope}' at task {self._task_label(task_id)} "
@@ -2099,7 +2278,7 @@ class ContinualLearner:
                 reallocated_now = max(0, capacity_before - capacity_after)
 
                 # Keep tracking set aligned after structural deletions.
-                alive_adapter_ids = {id(adapter) for _, _, adapter in self._iter_adapters()}
+                alive_adapter_ids = {self._adapter_uid(adapter) for _, _, adapter in self._iter_adapters()}
                 self.current_task_new_adapter_ids &= alive_adapter_ids
 
                 self.reallocation_history.append({
@@ -2107,7 +2286,13 @@ class ContinualLearner:
                     'scope': self.reallocation_scope,
                     'method': 'adapter_delete',
                     'amount': float(reallocation_amount),
-                    'importance': ('taylor' if self.reallocation_importance == 'taylor' else 'magnitude'),
+                    'importance': importance_name,
+                    'requested_importance': self.reallocation_importance,
+                    'fallback_reason': fallback_reason,
+                    'ratio_unit': 'fraction of candidate scalar parameters; whole-adapter overshoot allowed',
+                    'selected_adapters': selected,
+                    'candidates': candidates,
+                    'taylor_scoring': dict(self.last_taylor_gradient_stats) if taylor_ready else None,
                     'capacity_params_before': int(capacity_before),
                     'capacity_params_after': int(capacity_after),
                     'effective_params_before': int(before_effective),
@@ -2190,6 +2375,52 @@ class ContinualLearner:
             group_ids[idx] = int(group_to_id.get(group_value, -1))
         return group_ids
 
+    def _record_resource_event(self, task_id, phase):
+        stats = compute_model_size(self.model)
+        adapters = []
+        for layer, block, adapter in self._iter_adapters():
+            adapters.append({'uid': self._adapter_uid(adapter), 'layer': layer, 'block': block,
+                             'birth_task': getattr(adapter, 'scope_birth_task', None),
+                             'params': sum(p.numel() for p in adapter.parameters()),
+                             'trainable_params': sum(p.numel() for p in adapter.parameters() if p.requires_grad)})
+        self.observations.events.append({
+            'task_id': int(task_id), 'event': 'resources', 'phase': phase,
+            'model': stats, 'parameter_cap': self.max_params,
+            'headroom_params': self.max_params - stats['num_params'],
+            'replay': self.replay_buffer.get_storage_stats(), 'adapters': adapters,
+            'parent_process_memory': process_memory_stats(),
+        })
+
+    def _evaluation_results(self, task_id, test_loader, group_id_tensors=None):
+        names = dict(self.metric_groups)
+        if '__eval_task__' in (group_id_tensors or {}):
+            names['__eval_task__'] = [str(task) for task in range(task_id + 1)]
+        return evaluate_model_with_groups(
+            self.model, test_loader, task_id=task_id, device=self.device,
+            group_id_tensors=group_id_tensors, group_names=names)
+
+    def _capture_phase_snapshot(self, task_id, phase, loader, groups, results=None,
+                                reallocation_applied=None):
+        if loader is None:
+            return
+        with self.observations.phase(task_id, 'diagnostic_' + phase):
+            with observation_context(self.model, loader):
+                if results is None:
+                    results = self._evaluation_results(task_id, loader, groups)
+                raw = results.get('raw_results', results)
+                per_class = raw.get('per_class_acc', {})
+                entry = {'task_id': int(task_id), 'phase': phase,
+                         'reallocation_applied': reallocation_applied,
+                         'overall_accuracy': raw.get('accuracy', results.get('overall_accuracy')),
+                         'mca': sum(per_class.values()) / len(per_class) if per_class else None,
+                         'counts': raw.get('counts'), 'group_accuracy': raw.get('group_accuracy'),
+                         'group_counts': raw.get('group_counts'),
+                         'recovery_enabled': self.reallocation_recovery_enabled,
+                         'recovery_epochs': self.reallocation_recovery_epochs}
+                if self.observations.save_phase_models:
+                    entry['model_artifact'] = self.observations.save_model(self.model, task_id, phase)
+                self.observations.snapshots.append(entry)
+
     def _evaluate_and_update_metrics(
         self,
         task_id: int,
@@ -2200,70 +2431,28 @@ class ContinualLearner:
         if test_loader is None:
             return None
 
-        overall_accuracy = 0.0
-        per_class_acc = {}
-
-        try:
-            if group_id_tensors:
-                eval_results = evaluate_model_with_groups(
-                    self.model,
-                    test_loader,
-                    task_id=task_id,
-                    device=self.device,
-                    group_id_tensors=group_id_tensors,
-                    group_names=self.metric_groups
-                )
-                overall_accuracy = float(eval_results.get('accuracy', 0.0))
-                per_class_acc = eval_results.get('per_class_acc', {}) or {}
-                self.metrics.update_accuracy(task_id, overall_accuracy, per_class_acc)
-
-                grouped_acc = eval_results.get('group_accuracy', {}) or {}
-                grouped_per_class = eval_results.get('group_per_class_acc', {}) or {}
-                for group_name, group_values in grouped_acc.items():
-                    per_class_by_value = grouped_per_class.get(group_name, {}) or {}
-                    for group_value, value_acc in group_values.items():
-                        self.metrics.update_group_accuracy(
-                            group_name=group_name,
-                            group_value=group_value,
-                            task_id=task_id,
-                            accuracy=float(value_acc),
-                            class_accuracies=per_class_by_value.get(group_value, {})
-                        )
+        with self.observations.phase(task_id, 'primary_evaluation'):
+            eval_results = self._evaluation_results(task_id, test_loader, group_id_tensors)
+        if eval_results['counts']['total'] <= 0:
+            raise RuntimeError('Evaluation set is empty; refusing to record fabricated zero accuracy')
+        overall_accuracy = float(eval_results['accuracy'])
+        per_class_acc = eval_results['per_class_acc']
+        self.metrics.update_accuracy(task_id, overall_accuracy, per_class_acc)
+        self.metrics.evaluation_records.append({'checkpoint_task': int(task_id), **eval_results})
+        for group_name, values in eval_results['group_accuracy'].items():
+            if group_name == '__eval_task__':
+                self.metrics.record_task_matrix_row(task_id, {int(key): value for key, value in values.items()})
+                continue
+            for group_value, accuracy in values.items():
+                self.metrics.update_group_accuracy(
+                    group_name, group_value, task_id, float(accuracy),
+                    eval_results['group_per_class_acc'][group_name][group_value])
+        if self.use_amca and self.amca_tester:
+            if run_amca:
+                amca_results = self.amca_tester.record_from_per_class_dict(per_class_acc, overall_accuracy)
+                print(f"MCA: {amca_results['mean_class_accuracy']:.4f}, AMCA: {self.amca_tester.compute_amca():.4f}")
             else:
-                overall_accuracy, per_class_acc = evaluate_model(
-                    self.model,
-                    test_loader,
-                    task_id=task_id,
-                    device=self.device,
-                    return_per_class=True
-                )
-                self.metrics.update_accuracy(task_id, overall_accuracy, per_class_acc)
-            
-            if self.use_amca and self.amca_tester:
-                if run_amca:
-                    try:
-                        # Reuse per-class results from standard evaluation to avoid
-                        # a redundant second full forward pass over the test loader.
-                        if per_class_acc:
-                            amca_results = self.amca_tester.record_from_per_class_dict(
-                                per_class_acc,
-                                overall_accuracy=overall_accuracy
-                            )
-                        else:
-                            amca_results = self.amca_tester.evaluate(self.model, test_loader, device=self.device)
-                        print(f"MCA: {amca_results['mean_class_accuracy']:.4f}, AMCA: {self.amca_tester.compute_amca():.4f}")
-                    except Exception as e:
-                        print(f"AMCA error: {e}")
-                        self.amca_tester.mean_class_accuracies.append(0.0)
-                else:
-                    if per_class_acc:
-                        mca = sum(per_class_acc.values()) / len(per_class_acc)
-                        print(f"Current MCA: {mca:.4f}")
-                    else:
-                        print("MCA: N/A")
-        except Exception as e:
-            print(f"[ERROR] Evaluation failed: {e}")
-            return None
+                print(f"Current MCA: {sum(per_class_acc.values()) / len(per_class_acc):.4f}")
         
         model_stats = compute_model_size(self.model)
         buffer_memory = self.replay_buffer.get_memory_size()
@@ -2272,7 +2461,8 @@ class ContinualLearner:
         self.metrics.update_num_parameters(self._get_effective_model_params())
         return {
             'overall_accuracy': float(overall_accuracy),
-            'per_class_acc': per_class_acc
+            'per_class_acc': per_class_acc,
+            'raw_results': eval_results,
         }
 
     def _estimate_expand_layer_params_delta(self, layer_name: str) -> int:

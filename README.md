@@ -1,6 +1,6 @@
 # Structured Compression and Parameter Expansion (SCOPE)
 
-**Structured Compression and Parameter Expansion** (SCOPE) is a continual-learning model for object classification in Autonomous Driving scenarios.
+**Structured Compression and Parameter Expansion** (SCOPE) is a continual-learning model for object classification in autonomous driving scenarios.
 
 This repository contains training code for two object-classification benchmarks:
 
@@ -17,7 +17,7 @@ buffers/             Replay buffer with optional soft targets and distillation
 config/              Experiment configs for CLAD-C and BDD-C
 experiments/         Training entry points
 models/              Expandable ResNet50D model with adapter modules
-scripts/             Dataset preparation scripts
+scripts/             Data preparation, profiling and Grad-CAM
 trainers/            Continual-learning trainer and reallocation safeguards
 utils/               Metrics, losses, reports, experiment helpers, constants
 requirements.txt     Python dependencies
@@ -39,6 +39,16 @@ Important dependency notes:
 - `torch-pruning` is required for structural whole-model parameter reallocation.
 - CLAD-C requires the official CLAD repository to be available locally and referenced in `config/cladc_config.yaml`.
 
+Use a CUDA-enabled PyTorch build compatible with the training GPU, then install
+the runtime dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+The dependency file specifies minimum versions rather than a locked environment.
+Each run records its installed package versions.
+
 ## Data Preparation
 
 ### CLAD-C
@@ -59,7 +69,8 @@ Recommended source:
 
 - Dataset Ninja BDD100K: Images 100K: https://datasetninja.com/bdd100k
 
-Dataset Ninja provides the full BDD100K 100K image set with annotations and image-level attributes.
+Check that the downloaded export includes the detection annotations and
+image-level attributes required below.
 
 The current BDD-C preprocessing script expects BDD100K-style detection JSON files, not cropped images that have already been grouped into classes. After downloading, arrange or convert the downloaded data into this raw input layout:
 
@@ -73,7 +84,7 @@ The current BDD-C preprocessing script expects BDD100K-style detection JSON file
     val/
 ```
 
-Each label JSON must contain image-level `attributes.weather` and `attributes.timeofday`, plus object annotations under `frames[0].objects` with `box2d` and `category` fields. If the Dataset Ninja export is in Supervisely format, export or convert it to this BDD100K-style layout before running the split script.
+Each label JSON must contain image-level `attributes.weather` and `attributes.timeofday`, plus object annotations under `frames[0].objects` with `box2d` and `category` fields. If the export is in Supervisely, COCO, YOLO or classification-only format, convert it to this BDD100K-style layout before running the split script.
 
 The preprocessing script is:
 
@@ -123,14 +134,14 @@ Run commands from the repository root.
 
 ```bash
 python experiments/train_cladc.py \
-  --config config/cladc_config.yaml \
+  --config config/cladc_config.yaml --ablation reference --seed 42 --device cuda
 ```
 
 ### BDD-C
 
 ```bash
 python experiments/train_bddc.py \
-  --config config/bddc_config.yaml \
+  --config config/bddc_config.yaml --ablation reference --seed 42 --device cuda
 ```
 
 Each run writes:
@@ -139,68 +150,54 @@ Each run writes:
 - `final_model_<timestamp>.pt`
 - `final_model.pt`
 
-under the dataset-specific checkpoint directory.
+under the dataset-specific checkpoint directory. Named ablations isolate outputs
+at `checkpoints/<dataset>/ablations/<condition>/seed_<seed>/`. Omitting
+`--ablation` uses the base configuration and its `logging.save_dir` directly.
 
-## Main Configuration Fields
+Each execution uses a unique UTC time/random ID in report and timestamped checkpoint names.
+Each also writes `run_<id>/manifest.json` (effective config, Torch seed, code/data
+fingerprints and runtime) and `run_<id>/observations.json` (raw evaluation counts,
+task matrix where available, pruning/capacity records and phase costs).
 
-Both configs follow the same high-level structure.
+The supplied configs enable phase evaluations, phase-model export, synchronized
+CUDA cost measurements and final inference-model export. These produce extra
+evaluations and model artifacts. Their switches are `logging.phase_snapshots`,
+`save_phase_models`, `profile_cuda` and `save_inference_model`.
 
-### `benchmark`
+Compaction reduces replay occupancy while retaining the allocated backing
+tensors. Freezing historical adapters does not freeze predictions from a
+changing shared backbone.
 
-Defines dataset paths, task counts, evaluation split, and parameter-budget ratio.
+## Ablations
 
-### `model`
+Set `--ablation` to one of the following controls. Unspecified settings are
+inherited from the benchmark YAML.
 
-```yaml
-adapt_downsample_blocks: true | false
+| Condition | Change from the reference |
+| --- | --- |
+| `reference` | Keep the reference recipe; isolate outputs by seed. |
+| `no_recovery` | Disable recovery training. |
+| `no_compaction` | Disable end-of-task replay compaction. |
+| `expansion_only` | Disable parameter reallocation; recovery does not run without reallocation. |
+| `joint_adapters` | Train historical adapters during main training and recovery. |
+| `no_kd` | Disable KD in training and Taylor scoring; retain replay CE, stored targets and compaction. |
+| `fixed_architecture` | Disable expansion, reallocation and recovery. |
+| `no_recovery_no_compaction` | Disable recovery and compaction together. |
+| `tight_param_cap` | Set cap ratios to 1.025 for CLAD-C and 1.05 for BDD-C. |
+| `small_replay` | Set capacities to 500 for CLAD-C and 2,500 for BDD-C. |
+
+Use seeds 42–46 for the five-run protocol. For example:
+
+```bash
+for seed in 42 43 44 45 46; do
+  python experiments/train_bddc.py --config config/bddc_config.yaml \
+    --ablation no_kd --seed "$seed" --device cuda || break
+done
 ```
 
-### `training`
-
-Controls epochs, optimizer, learning rate, AMP, gradient accumulation, and class-balanced loss.
-
-Useful ablation fields:
-
-```yaml
-use_class_balanced_loss: true | false
-```
-
-CLAD-C currently uses gradient accumulation by config. BDD-C disables gradient accumulation inside `experiments/train_bddc.py` so the configured batch size is used directly.
-
-### `replay_buffer`
-
-Controls rehearsal memory, optional stored soft targets, and optional distillation loss.
-
-Useful ablation fields:
-
-```yaml
-use_soft_targets: true | false
-use_distillation_loss: true | false
-auto_distill_end_of_task: true | false
-```
-
-`use_soft_targets` controls whether soft targets are computed and stored when adding examples to the buffer. `use_distillation_loss` controls whether replay batches use the KL distillation term during training.
-
-### `network_expansion`
-
-Controls adapter expansion at the start of each task.
-
-
-The current strategy expands adapters in layer2 and layer3 at task start.
-There is also the option of expanding all layers at task start.
-
-### `parameter_reallocation`
-
-Controls end-of-task parameter reallocation.
-
-Supported options are:
-
-- `whole_model`
-- `older_adapters_only`
-- `all_adapters`
-- `hybrid`
-
-Whole-model reallocation is structural only.
+The joint-adapter control keeps the reference structural-scoring trainability
+policy. Structural pruning amounts are channel ratios, while whole-adapter
+deletion uses a scalar-parameter target and can overshoot by one whole adapter.
 
 ## Result Files
 
@@ -216,3 +213,52 @@ The result report includes:
 - final model parameter count,
 - total training time,
 - reallocation history.
+
+Final inference artifacts (`run_<id>/task_<N>_final_model.pt`) contain the actual
+compressed architecture and weights. They are separate from training-state
+checkpoints and do not provide a full training-resume workflow.
+
+AMCA averages primary task-end mean class accuracies. Diagnostic snapshots do
+not enter that history. BDD-C also records a task evaluation matrix for
+forgetting and backward transfer. CLAD-C uses a common evaluation set, so its
+checkpoint trajectory does not provide a task-specific forgetting matrix. Its
+loader obtains official 64×64 crops before resizing normalized tensors to
+224×224; class zero is unused.
+
+## Profiling and Grad-CAM
+
+The three scripts cover dataset preparation (`bddc_split.py`), inference
+profiling (`profile_inference.py`) and qualitative inspection
+(`qualitative_examples.py`). Training uses the entry points in `experiments/`.
+
+Profile a saved final architecture and weights without training:
+
+```bash
+python scripts/profile_inference.py \
+  --model-artifact /path/to/run_ID/task_5_final_model.pt \
+  --device cuda --amp --batch-size 1 --image-size 224 \
+  --warmup 50 --iterations 500 --output outputs/inference.json
+```
+
+The profiler measures resident-input forward execution, excluding loading,
+preprocessing and transfer. Compare models on the same idle GPU with matching
+settings. MAC counts cover Conv2d/Linear modules only, not total model FLOPs.
+Model tensor storage and peak CUDA allocation are separate measurements.
+
+Export metadata-stratified Grad-CAM examples:
+
+```bash
+python scripts/qualitative_examples.py --config config/bddc_config.yaml \
+  --model-artifact /path/to/run_ID/task_5_final_model.pt \
+  --device cuda --group weather --layer layer4 \
+  --max-examples 24 --max-samples 1000 --output-dir outputs/examples
+```
+
+For CLAD-C, use its config, final task 6 and `--group location`. Use
+`--selection-json /path/to/selection.json` to reuse the same images for another
+SCOPE configuration; labels, metadata and input hashes are checked. Grad-CAM
+targets each model's predicted class. Selected examples illustrate behavior and
+are not an accuracy sample.
+
+Recorded seeds and source fingerprints support provenance; they do not
+guarantee bitwise reproducibility across hardware and package versions.

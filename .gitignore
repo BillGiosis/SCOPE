@@ -1,6 +1,26 @@
-/checkpoints
+# Generated experiments and analysis artifacts
+/checkpoints/
+/analysis/
+/outputs/
+/final_evaluation*/
+/diagnostics*/
+*.log
+*.tmp
 
-# Python bytecode cache directories
-**/__pycache__/
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
 
-.*
+# Local editor and agent metadata
+.idea/
+.vscode/
+.agents/
+.aws/
+.codex
+.env
+.DS_Store

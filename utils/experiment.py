@@ -9,6 +9,7 @@ import yaml
 from buffers.replay_buffer import ReplayBuffer
 from models.expandable_resnet import create_expandable_resnet
 from trainers.continual_trainer import create_trainer
+from utils.observations import start_run
 
 
 def load_config(config_path: str) -> dict:
@@ -68,3 +69,6 @@ def save_final_checkpoints(trainer, save_dir: str, timestamp: str, task_id: int)
     trainer.save_checkpoint(final_path, task_id)
     latest_path = os.path.join(save_dir, 'final_model.pt')
     trainer.save_checkpoint(latest_path, task_id)
+    if trainer.config.get('logging', {}).get('save_inference_model', False):
+        trainer.observations.save_model(trainer.model, task_id, 'final')
+    trainer.observations.flush(trainer)

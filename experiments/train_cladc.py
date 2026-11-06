@@ -11,14 +11,15 @@ import torch
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from benchmarks.cladc import create_cladc_benchmark
+from utils.ablations import ABLATION_NAMES, apply_ablation
 from utils.experiment import (
     configure_torch_runtime,
     create_model_from_config,
     create_replay_buffer_from_config,
     create_trainer_from_config,
     load_config,
-    make_timestamp,
     save_final_checkpoints,
+    start_run,
 )
 from utils.reports_cladc import write_cladc_results
 
@@ -26,13 +27,15 @@ from utils.reports_cladc import write_cladc_results
 def main(args):
     configure_torch_runtime(args.seed)
 
-    config = load_config(args.config)
+    config = apply_ablation(load_config(args.config), getattr(args, 'ablation', None), seed=args.seed)
     expansion_cfg = config.get('network_expansion', {})
     reallocation_cfg = config.get('parameter_reallocation', {})
     model_cfg = config.get('model', {})
     expansion_strategy = str(expansion_cfg.get('strategy', 'all_layers')).strip().lower()
 
     print(f"Configuration loaded from {args.config}")
+    if getattr(args, 'ablation', None):
+        print(f"SCOPE ablation: {args.ablation}; output: {config['logging']['save_dir']}")
     print(f"Adapt Downsample Blocks: {model_cfg.get('adapt_downsample_blocks', True)}")
     print(f"Network Expansion Strategy: {expansion_strategy}")
     print(f"Parameter Reallocation Enabled: {reallocation_cfg.get('enabled', False)}")
@@ -64,6 +67,8 @@ def main(args):
         device=args.device,
         use_amca=True
     )
+    start_run(config, args.seed, args.device, args.config, benchmark, model)
+    trainer.observations.directory = config['run']['artifact_dir']
 
     print(f"\n{'=' * 60}")
     print("Starting continual learning training")
@@ -80,7 +85,7 @@ def main(args):
     print(f"{'=' * 60}\n")
     trainer.metrics.print_summary(num_tasks - 1)
 
-    timestamp = make_timestamp()
+    timestamp = config['run']['id']
     results_file = write_cladc_results(config, trainer, timestamp)
     print(f"\nFinal metrics saved to: {results_file}")
 
@@ -102,4 +107,5 @@ if __name__ == "__main__":
         help='Device to use for training'
     )
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    parser.add_argument('--ablation', choices=ABLATION_NAMES, help='Apply a named SCOPE control to the YAML recipe')
     main(parser.parse_args())

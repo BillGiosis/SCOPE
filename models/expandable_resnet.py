@@ -110,6 +110,12 @@ class ExpandableResNet(nn.Module):
                 raise RuntimeError("timm not available. Please install: pip install timm>=0.9.0")
         else:
             raise ValueError(f"Unknown backbone: {backbone_name}. Only 'resnet50d' is supported.")
+
+        self.pretrained_metadata = {
+            key: value for key, value in getattr(base_model, 'pretrained_cfg', {}).items()
+            if key in {'architecture', 'tag', 'url', 'hf_hub_id', 'input_size',
+                       'mean', 'std', 'interpolation', 'num_classes'}
+        }
         
         self.conv1 = base_model.conv1
         self.bn1 = base_model.bn1

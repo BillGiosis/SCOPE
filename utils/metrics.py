@@ -183,6 +183,10 @@ class MetricsTracker:
         self.num_parameters = []
 
         self.task_times = {}
+        # Rows identify the training checkpoint; columns identify evaluated tasks.
+        # Common validation sets have no task partition and leave this matrix empty.
+        self.accuracy_matrix = {}
+        self.evaluation_records = []
 
     @staticmethod
     def _nested_defaultdict_dict():
@@ -235,6 +239,8 @@ class MetricsTracker:
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+        self.accuracy_matrix = state.get('accuracy_matrix', {})
+        self.evaluation_records = state.get('evaluation_records', [])
         self.task_accuracies = defaultdict(list, {
             task_id: list(values)
             for task_id, values in self.task_accuracies.items()
@@ -296,8 +302,8 @@ class MetricsTracker:
         """Record time taken to train a task."""
         self.task_times[task_id] = time_seconds
     
-    def get_average_accuracy(self, up_to_task: Optional[int] = None) -> float:
-        """Get average accuracy across all tasks."""
+    def get_checkpoint_average_accuracy(self, up_to_task: Optional[int] = None) -> float:
+        """Mean of recorded checkpoint accuracies; these may use different test unions."""
         if up_to_task is None:
             up_to_task = self.num_tasks - 1
         
@@ -308,21 +314,44 @@ class MetricsTracker:
         
         return float(np.mean(accuracies)) if accuracies else 0.0
     
-    def get_forgetting(self, current_task: int) -> float:
-        """Calculate average forgetting."""
-        forgetting_scores = []
-        
-        for task_id in range(current_task):
-            if task_id in self.best_task_accuracies and \
-               task_id in self.task_accuracies and \
-               len(self.task_accuracies[task_id]) > 0:
-                
-                best_acc = self.best_task_accuracies[task_id]
-                current_acc = self.task_accuracies[task_id][-1]
-                forgetting = max(0, best_acc - current_acc)
-                forgetting_scores.append(forgetting)
-        
-        return float(np.mean(forgetting_scores)) if forgetting_scores else 0.0
+    def record_task_matrix_row(self, checkpoint_task: int, task_accuracies: Dict[int, float]):
+        self.accuracy_matrix[int(checkpoint_task)] = {
+            int(task): float(accuracy) for task, accuracy in task_accuracies.items()
+        }
+
+    def get_average_accuracy(self, up_to_task: Optional[int] = None) -> Optional[float]:
+        """Current model's unweighted average over evaluated seen tasks, if available."""
+        current = self.num_tasks - 1 if up_to_task is None else up_to_task
+        row = self.accuracy_matrix.get(current, {})
+        if any(task not in row for task in range(current + 1)):
+            return None
+        return float(np.mean([row[task] for task in range(current + 1)]))
+
+    def get_forgetting(self, current_task: int) -> Optional[float]:
+        row = self.accuracy_matrix.get(current_task, {})
+        if not row or any(task not in row for task in range(current_task)):
+            return None
+        scores = []
+        for task in range(current_task):
+            previous = [self.accuracy_matrix[checkpoint][task]
+                        for checkpoint in range(task, current_task)
+                        if task in self.accuracy_matrix.get(checkpoint, {})]
+            if not previous:
+                return None
+            scores.append(max(0.0, max(previous) - row[task]))
+        return float(np.mean(scores)) if scores else 0.0
+
+    def get_backward_transfer(self, current_task: int) -> Optional[float]:
+        row = self.accuracy_matrix.get(current_task, {})
+        if not row:
+            return None
+        scores = []
+        for task in range(current_task):
+            diagonal = self.accuracy_matrix.get(task, {}).get(task)
+            if diagonal is None or task not in row:
+                return None
+            scores.append(row[task] - diagonal)
+        return float(np.mean(scores)) if scores else 0.0
     
     def get_current_memory(self) -> float:
         return self.memory_usage[-1] if self.memory_usage else 0.0
@@ -338,6 +367,8 @@ class MetricsTracker:
         summary = {
             'average_accuracy': self.get_average_accuracy(current_task),
             'forgetting': self.get_forgetting(current_task),
+            'backward_transfer': self.get_backward_transfer(current_task),
+            'checkpoint_average_accuracy': self.get_checkpoint_average_accuracy(current_task),
             'memory_mb': self.get_current_memory(),
             'total_compute_seconds': self.get_total_compute_cost(),
             'num_parameters': self.num_parameters[-1] if self.num_parameters else 0,
@@ -352,12 +383,15 @@ class MetricsTracker:
         print("\n" + "="*60)
         print(f"Metrics Summary (After Task {int(current_task) + 1})")
         print("="*60)
-        print(f"Average Accuracy:     {summary['average_accuracy']:.4f}")
-        print(f"Forgetting:           {summary['forgetting']:.4f}")
-        print(f"Memory Usage:         {summary['memory_mb']:.2f} MB")
+        for label, key in [('Seen-task Accuracy', 'average_accuracy'), ('Forgetting', 'forgetting'),
+                           ('Backward Transfer', 'backward_transfer')]:
+            value = summary[key]
+            print(f"{label}: {'N/A (no task evaluation matrix)' if value is None else f'{value:.4f}'}")
+        print(f"Checkpoint Mean Acc:  {summary['checkpoint_average_accuracy']:.4f}")
+        print(f"Model + Replay Tensor Storage: {summary['memory_mb']:.2f} MB")
         print(f"Total Compute Time:   {summary['total_compute_seconds']:.2f} s")
         print(f"Parameters:           {summary['num_parameters']:,}")
-        print("\nPer-Task Accuracies:")
+        print("\nEvaluation Accuracy at Each Training Checkpoint:")
         for task_id, acc in sorted(summary['task_accuracies'].items()):
             print(f"  Task {int(task_id) + 1}: {acc:.4f}")
         print("="*60 + "\n")
@@ -473,6 +507,8 @@ def evaluate_model_with_groups(
         ids = group_id_tensors.get(group_name)
         if ids is None or not torch.is_tensor(ids) or ids.numel() == 0 or not names:
             continue
+        if ids.numel() != len(dataloader.dataset):
+            raise ValueError(f'Group IDs for {group_name} do not align with the evaluation dataset')
         group_ids = ids.detach().to(device=device, dtype=torch.long, non_blocking=True)
         active_groups[group_name] = {
             'names': list(names),
@@ -592,9 +628,11 @@ def evaluate_model_with_groups(
 
     group_accuracy = {}
     group_per_class_acc = {}
+    group_counts = {}
     for group_name, group_stats in active_groups.items():
         group_accuracy[group_name] = {}
         group_per_class_acc[group_name] = {}
+        group_counts[group_name] = {}
         total_class_np = group_stats['total_class_counts'].cpu().numpy()
         correct_class_np = group_stats['correct_class_counts'].cpu().numpy()
 
@@ -612,12 +650,20 @@ def evaluate_model_with_groups(
                 if cls_total > 0:
                     value_per_class[c] = float(correct_class_np[value_id][c] / cls_total)
             group_per_class_acc[group_name][value_name] = value_per_class
+            group_counts[group_name][value_name] = {
+                'correct': group_correct, 'total': group_total,
+                'class_correct': correct_class_np[value_id].astype(int).tolist(),
+                'class_total': total_class_np[value_id].astype(int).tolist(),
+            }
 
     return {
         'accuracy': float(accuracy),
         'per_class_acc': per_class_acc,
         'group_accuracy': group_accuracy,
-        'group_per_class_acc': group_per_class_acc
+        'group_per_class_acc': group_per_class_acc,
+        'counts': {'correct': int(total_correct), 'total': int(total_samples),
+                   'class_correct': c_counts.astype(int).tolist(), 'class_total': t_counts.astype(int).tolist()},
+        'group_counts': group_counts,
     }
 
 

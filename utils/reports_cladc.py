@@ -144,10 +144,10 @@ def write_cladc_location_summary(f, trainer):
 
 def write_cladc_combo_metrics(f, trainer, num_tasks: int):
     combo_groups = {
-        'Day Combinations (Tasks 1,3,5)': [0, 2, 4],
-        'Night Combinations (Tasks 2,4,6)': [1, 3, 5],
+        'Checkpoints after daytime training tasks (1,3,5)': [0, 2, 4],
+        'Checkpoints after nighttime training tasks (2,4,6)': [1, 3, 5],
     }
-    f.write("\nTask-Combination Per-Class + AMCA:\n")
+    f.write("\nCommon-validation checkpoint combinations (not day/night evaluation subsets):\n")
     for combo_name, combo_task_ids in combo_groups.items():
         valid_task_ids = [tid for tid in combo_task_ids if tid < num_tasks and tid in trainer.metrics.task_class_accuracies]
         f.write(f"  {combo_name}:\n")
@@ -176,6 +176,6 @@ def write_cladc_combo_metrics(f, trainer, num_tasks: int):
                     f.write(f"    {class_name}: {combo_means[cid]:.4f}\n")
                 else:
                     f.write(f"    {class_name}: N/A\n")
-            f.write(f"    AMCA: {combo_amca:.4f}\n")
+            f.write(f"    Mean checkpoint class accuracy: {combo_amca:.4f}\n")
         else:
             f.write("    N/A\n")

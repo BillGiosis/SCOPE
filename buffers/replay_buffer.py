@@ -281,6 +281,30 @@ class ReplayBuffer:
             soft_elements_per_sample = self.soft_targets[0].numel()
             size_bytes += slots * soft_elements_per_sample * element_size
         return size_bytes / (1024 ** 2)
+
+    def get_storage_stats(self) -> Dict:
+        """Separate occupied payload from allocated backing tensors (not process RAM)."""
+        backing_bytes = 0
+        occupied_bytes = 0
+        for tensor in (self.images, self.labels, self.task_ids, self.soft_targets):
+            if tensor is None:
+                continue
+            backing_bytes += tensor.untyped_storage().nbytes()
+            occupied_bytes += tensor[:self.num_samples].numel() * tensor.element_size()
+        cache_bytes = (self.sampling_weights.numel() * self.sampling_weights.element_size()
+                       if self.sampling_weights is not None else 0)
+        labels = self.labels[:self.num_samples].detach().cpu() if self.labels is not None else None
+        tasks = self.task_ids[:self.num_samples].detach().cpu() if self.task_ids is not None else None
+        def counts(values):
+            if values is None or values.numel() == 0:
+                return {}
+            keys, frequencies = torch.unique(values, return_counts=True)
+            return {int(k): int(v) for k, v in zip(keys, frequencies)}
+        return {'samples': int(self.num_samples), 'capacity_samples': int(self.max_size),
+                'occupied_payload_bytes': int(occupied_bytes),
+                'allocated_backing_bytes': int(backing_bytes), 'sampling_cache_bytes': int(cache_bytes),
+                'label_counts': counts(labels), 'task_counts': counts(tasks),
+                'storage_device': str(self.storage_device), 'fp16_storage': bool(self.use_fp16)}
     
     def __len__(self):
         return self.num_samples
