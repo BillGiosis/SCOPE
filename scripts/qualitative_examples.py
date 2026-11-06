@@ -1,4 +1,4 @@
-"""Export stratified success and failure examples with predicted-class Grad-CAM.
+"""Export stratified success and failure examples with class-specific Grad-CAM.
 
 This is an offline classification diagnostic. Candidates are spread over metadata
 domains/classes/tasks; success/failure selection precedes inspecting activation maps.
@@ -42,12 +42,27 @@ def grad_cam(model, image, target_layer, class_id):
         handle.remove()
 
 
-def export_overlay(image, cam, path):
+def colorize_cam(cam):
+    """Map normalized activations to a blue/cyan/yellow/red colour scale."""
+    values = np.clip(np.asarray(cam, dtype=np.float32), 0, 1) * 4
+    return np.stack([
+        np.clip(1.5 - np.abs(values - 3), 0, 1),
+        np.clip(1.5 - np.abs(values - 2), 0, 1),
+        np.clip(1.5 - np.abs(values - 1), 0, 1),
+    ], axis=-1)
+
+
+def export_overlay(image, cam, path, alpha=0.6):
+    """Show the original image beside a consistently coloured activation map."""
+    if not 0 <= alpha <= 1:
+        raise ValueError('Overlay alpha must be between zero and one')
+    if not np.isfinite(cam).all():
+        raise ValueError('Cannot display a nonfinite Grad-CAM map')
     pixels = image.detach().cpu().float().permute(1, 2, 0).numpy()
     pixels = np.clip(pixels * np.asarray(IMAGENET_STD) + np.asarray(IMAGENET_MEAN), 0, 1)
-    heat = np.stack([cam, np.zeros_like(cam), 1 - cam], axis=-1)
+    heat = colorize_cam(cam)
     original = (pixels * 255).astype(np.uint8)
-    overlay = (np.clip(.65 * pixels + .35 * heat, 0, 1) * 255).astype(np.uint8)
+    overlay = (np.clip((1 - alpha) * pixels + alpha * heat, 0, 1) * 255).astype(np.uint8)
     Image.fromarray(np.concatenate([original, overlay], axis=1)).save(path)
 
 
@@ -145,6 +160,12 @@ def fixed_candidates(loaders, selection, group):
 def main(args):
     if args.max_samples < 1 or args.max_examples < 1 or args.per_stratum < 1:
         raise ValueError('Selection limits must be positive')
+    overlay_alpha = float(getattr(args, 'overlay_alpha', 0.6))
+    if not 0 <= overlay_alpha <= 1:
+        raise ValueError('Overlay alpha must be between zero and one')
+    cam_target = getattr(args, 'cam_target', 'predicted')
+    if cam_target not in {'predicted', 'ground_truth'}:
+        raise ValueError('CAM target must be predicted or ground_truth')
     config = load_config(args.config)
     config['data_loading']['num_workers'] = 0
     name = config['benchmark']['name'].lower()
@@ -200,13 +221,20 @@ def main(args):
         if supplied is None and counts[key] >= args.per_stratum:
             continue
         counts[key] += 1
-        cam = grad_cam(model, input_image, layer, prediction)
+        target_class = prediction if cam_target == 'predicted' else label
+        cam = grad_cam(model, input_image, layer, target_class)
         filename = f'example_{len(selected):04d}.png'
-        export_overlay(image, cam, directory / filename)
+        export_overlay(image, cam, directory / filename, alpha=overlay_alpha)
+        array_name = None
+        if getattr(args, 'save_cam_arrays', False):
+            array_name = Path(filename).with_suffix('.npy').name
+            np.save(directory / array_name, cam)
         selected.append({'loader_id': loader_id, 'dataset_index': index, 'domain': domain,
                          'true_class': label, 'predicted_class': prediction, 'confidence': confidence,
                          'true_class_name': class_names[label], 'predicted_class_name': class_names[prediction],
                          'correct': correct, 'image': filename,
+                         'cam_target_class': target_class, 'cam_target_class_name': class_names[target_class],
+                         'cam_array': array_name, 'constant_map': float(np.ptp(cam)) <= 1e-8,
                          'input_sha256': image_hash,
                          'task_name': getattr(dataset, 'task_name', 'common_validation')})
         if getattr(args, 'export_input_bundle', None):
@@ -233,7 +261,9 @@ def main(args):
             'first successes/failures per domain/class/task stratum'
         ),
         'selection_source': str(Path(selection_path).resolve()) if selection_path else None,
-        'cam_target': 'predicted class', 'examined_samples': examined,
+        'cam_target': 'predicted class' if cam_target == 'predicted' else 'ground-truth class',
+        'overlay_alpha': overlay_alpha, 'colour_scale': 'blue/cyan/yellow/red; per-image normalized [0,1]',
+        'examined_samples': examined,
         'max_samples': args.max_samples, 'max_examples': args.max_examples, 'per_stratum': args.per_stratum,
         'examples': selected,
     })
@@ -261,6 +291,12 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--group', required=True, choices=['weather', 'timeofday', 'location'])
     parser.add_argument('--layer', default='layer4')
+    parser.add_argument('--cam-target', choices=['predicted', 'ground_truth'], default='predicted')
+    parser.add_argument('--overlay-alpha', type=float, default=0.6, help='Heatmap blend weight between zero and one')
+    parser.add_argument(
+        '--save-cam-arrays', action='store_true',
+        help='Save normalized maps for recolouring without inference'
+    )
     parser.add_argument('--per-stratum', type=int, default=2)
     parser.add_argument('--max-examples', type=int, default=100)
     parser.add_argument('--max-samples', type=int, default=1000)

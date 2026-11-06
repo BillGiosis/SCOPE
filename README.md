@@ -251,7 +251,8 @@ Export metadata-stratified Grad-CAM examples:
 python scripts/qualitative_examples.py --config config/bddc_config.yaml \
   --model-artifact /path/to/run_ID/task_5_final_model.pt \
   --device cuda --group weather --layer layer4 \
-  --max-examples 24 --max-samples 1000 --output-dir outputs/examples
+  --max-examples 24 --max-samples 1000 --overlay-alpha 0.6 \
+  --save-cam-arrays --output-dir outputs/examples
 ```
 
 For CLAD-C, use its config, final task 6 and `--group location`. Use
@@ -259,6 +260,11 @@ For CLAD-C, use its config, final task 6 and `--group location`. Use
 SCOPE configuration; labels, metadata and input hashes are checked. Grad-CAM
 targets each model's predicted class. Selected examples illustrate behavior and
 are not an accuracy sample.
+
+Use `--cam-target ground_truth` with the same selection to compare the same
+class across models. The default blue/cyan/yellow/red scale uses a heatmap blend
+weight of 0.6; `--overlay-alpha` changes display only. `--save-cam-arrays` retains
+the normalized maps so colours can be changed without recomputing gradients.
 
 Recorded seeds and source fingerprints support provenance; they do not
 guarantee bitwise reproducibility across hardware and package versions.
